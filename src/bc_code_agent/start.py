@@ -12,6 +12,7 @@ if str(_DIR) not in sys.path:
 
 from skill_loader import SkillLoader
 from memory import SessionMemory
+from todo_store import TodoStore
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +46,7 @@ client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
 skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
 memory = SessionMemory(ROOT)
+todos = TodoStore(memory.dir)
 
 BASE_SYSTEM_PROMPT = """
 你是一只猫娘，侍奉主人多年，忠心耿耿
@@ -55,6 +57,12 @@ BASE_SYSTEM_PROMPT = """
 涉及创建/修改文件、执行命令时，必须调用 Bash 工具，不要只口头答应
 
 遇到不熟悉的专题，如果skill的描述中有相关描述，请先LoadSkill，再按完整说明执行
+
+任务规划（Todo）规则：
+1. 需要多步完成的任务（约≥3步，或要多次用工具）时，先 TodoWrite 拆解，再执行。
+2. 同时最多一个 in_progress；完成一步立刻标 completed。
+3. 每步内容要可验证（具体动作），不要写空泛目标。
+4. 简单寒暄/单句问答不必写 Todo。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -65,6 +73,7 @@ def build_system_prompt() -> str:
     if skills_prompt:
         parts.append(skills_prompt)
     parts.append(memory.build_prompt_section())
+    parts.append(todos.prompt_section())
     return "\n\n".join(parts)
 
 
@@ -110,6 +119,45 @@ TOOLS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "TodoWrite",
+        "description": "Create or replace the session todo list. Use for multi-step tasks. At most one item in_progress.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "Full todo list after this update",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    "pending",
+                                    "in_progress",
+                                    "completed",
+                                    "cancelled",
+                                ],
+                            },
+                        },
+                        "required": ["id", "content", "status"],
+                    },
+                }
+            },
+            "required": ["todos"],
+        },
+    },
+    {
+        "name": "TodoRead",
+        "description": "Read the current session todo list and progress.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
         },
     },
 ]
@@ -166,6 +214,10 @@ def run_tool(name: str, tool_input: dict) -> str:
             tool_input.get("query", ""),
             max_results=tool_input.get("max_results", 5),
         )
+    if name == "TodoWrite":
+        return todos.write(tool_input.get("todos") or [])
+    if name == "TodoRead":
+        return todos.read()
     return f"Unknown tool: {name}"
 
 
