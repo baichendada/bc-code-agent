@@ -110,6 +110,10 @@ ANTHROPIC_AUTH_TOKEN=your-token
 ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
 ANTHROPIC_MODEL=glm-5.2
 MAX_TOKENS=10000
+
+# 智谱思考配置（见 docs.bigmodel.cn 深度思考）
+THINKING_TYPE=enabled
+REASONING_EFFORT=high
 ```
 
 ```bash

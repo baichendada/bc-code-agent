@@ -21,6 +21,8 @@ API_KEY = os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY")
 BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
 MODEL = os.getenv("ANTHROPIC_MODEL")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "10000"))
+THINKING_TYPE = os.getenv("THINKING_TYPE", "enabled")
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")
 
 if not API_KEY:
     raise SystemExit(f"缺少 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（检查 {_ENV_PATH}）")
@@ -51,6 +53,10 @@ while True:
         max_tokens=MAX_TOKENS,
         messages=history,
         system=SYSTEM_PROMPT,
+        extra_body={
+            "thinking": {"type": THINKING_TYPE},
+            "reasoning_effort": REASONING_EFFORT,
+        },
     )
 
     reply = next((b.text for b in message.content if b.type == "text"), "")
