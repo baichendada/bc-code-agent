@@ -29,18 +29,26 @@ if not MODEL:
 
 client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
 
-# Step 2：可连续提问，但每次只传本轮 user → 无记忆
+# Step 3：自己维护多轮 history，每次把完整列表传给模型
+history = []
+
 while True:
     user_input = input("Enter a prompt: ")
     if not user_input.strip():
         continue
 
+    history.append({"role": "user", "content": user_input})
+
     print("[Agent]: ", end="", flush=True)
+    assistant_text = ""
     with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        messages=[{"role": "user", "content": user_input}],
+        messages=history,  # 关键：传整段历史，不要只传本轮
     ) as stream:
         for text in stream.text_stream:
             print(text, end="", flush=True)
+            assistant_text += text
     print()
+
+    history.append({"role": "assistant", "content": assistant_text})

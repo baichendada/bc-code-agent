@@ -6,7 +6,8 @@
 
 - [x] **Step 1**：单轮对话（Anthropic Messages API，流式输出）
 - [x] **Step 2**：输入循环（`while True`），但**无会话记忆**
-- [ ] Step 3：带 history 的多轮对话（待做）
+- [x] **Step 3**：用 `history` 维护多轮对话（有记忆）
+- [ ] Step 4：工具调用（待做）
 
 ## Step 2 现象：能循环，但不记得上文
 
@@ -35,7 +36,35 @@ Enter a prompt: 我今年几岁
 
 同一进程、同一循环里，刚说过「13 岁」，下一句却完全想不起来——不是模型「变笨了」，而是上一轮内容根本没放进这次 `messages`。
 
-结论：**循环 ≠ 记忆**。记忆需要自己维护 history（把每轮 user / assistant 追加后再请求）。这就是 Step 3 要做的事。
+结论：**循环 ≠ 记忆**。记忆需要自己维护 history（把每轮 user / assistant 追加后再请求）。
+
+## Step 3：带 history 的多轮对话
+
+关键改动：
+
+1. 进程内维护 `history = []`
+2. 每轮先 `append` user，再把**整份** `history` 传给模型（不是只传本轮）
+3. 流式拼出完整 `assistant_text` 后再 `append` assistant
+
+```python
+history.append({"role": "user", "content": user_input})
+# ...
+messages=history
+# ...
+history.append({"role": "assistant", "content": assistant_text})
+```
+
+### 实录（2026-08-09）
+
+```text
+Enter a prompt: 我13岁
+[Agent]: 你好呀！很高兴和你聊天。13岁是一个非常棒的年纪……
+
+Enter a prompt: 我几岁了
+[Agent]: 你刚刚告诉我啦，你 **13岁** 呀！🎂
+```
+
+同题对比 Step 2：现在模型能引用上一轮说过的年龄。
 
 ## 快速开始
 
