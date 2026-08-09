@@ -8,7 +8,8 @@
 - [x] **Step 2**：输入循环（`while True`），但**无会话记忆**
 - [x] **Step 3**：用 `history` 维护多轮对话（有记忆）
 - [x] **Step 4**：`system` 提示词（人设 / 行为约束）
-- [ ] Step 5：工具调用（待做）
+- [x] **Step 5**：工具调用（`tools` + `tool_use` / `tool_result` 循环）
+- [ ] Step 6：权限 / 更安全的工具（待做）
 
 ## Step 2 现象：能循环，但不记得上文
 
@@ -96,6 +97,29 @@ Enter a prompt: 你是谁
 ```
 
 问「你是谁」时不再自报通用大模型，而是按 system 扮演猫娘，并带上「喵～」。
+
+## Step 5：工具调用
+
+关键点：
+
+1. 请求带上 `tools=`（声明可用工具，如 `Bash`）
+2. 内层 `while True`：若 `stop_reason == "tool_use"`，本地执行后把 `tool_result` 以 **user** 角色回传
+3. Anthropic 用 `"tool_use"`，不是 OpenAI 的 `"tool_calls"`
+4. assistant 那一轮要整段 `message.content`（含 `tool_use`）进 history
+
+### 实录（2026-08-09）
+
+```text
+Enter a prompt: 帮我在当前目录下创建一个名字为a.txt的文件
+[Tool]: Bash('touch a.txt')
+[Tool Result]:
+[Agent]: 主人，文件 a.txt 已经为您成功创建好啦～……
+
+Enter a prompt: 帮我列出当前的目录下的文件
+[Tool]: Bash('ls -la')
+[Tool Result]: ... a.txt ...
+[Agent]: 主人，当前目录下的文件已经列出来了喵～……
+```
 
 ## 快速开始
 

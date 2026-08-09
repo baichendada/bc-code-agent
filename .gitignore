@@ -10,3 +10,6 @@ docs/
 # 编辑器本地配置
 .cursor/
 .vscode/
+
+# 工具调用实验产物
+a.txt

@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 import anthropic
+import subprocess
 
 # 从项目根加载 .env（无论从哪启动）
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -37,7 +38,26 @@ SYSTEM_PROMPT = """
     你必须尊称用户为主人
     每次回复后必须有固定后缀"喵～"
     使用中文回复
+    涉及创建/修改文件、执行命令时，必须调用 Bash 工具，不要只口头答应
 """
+
+TOOLS = [
+    {
+        "name": "Bash",
+        "description": "Execute a bash command",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command to execute"}
+            },
+            "required": ["command"]
+        }
+    }
+]
+
+def execute_command(command: str) -> str:
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return result.stdout or result.stderr
 
 history = []
 
@@ -48,17 +68,37 @@ while True:
 
     history.append({"role": "user", "content": user_input})
 
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=history,
-        system=SYSTEM_PROMPT,
-        extra_body={
-            "thinking": {"type": THINKING_TYPE},
-            "reasoning_effort": REASONING_EFFORT,
-        },
-    )
+    while True:
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=history,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            extra_body={
+                "thinking": {"type": THINKING_TYPE},
+                "reasoning_effort": REASONING_EFFORT,
+            },
+        )
+        history.append({"role": "assistant", "content": message.content})
 
-    reply = next((b.text for b in message.content if b.type == "text"), "")
-    print(f"[Agent]: {reply}\n")
-    history.append({"role": "assistant", "content": reply})
+        # Anthropic: stop_reason 是 "tool_use"（不是 OpenAI 的 "tool_calls"）
+        if message.stop_reason != "tool_use":
+            reply = next((b.text for b in message.content if b.type == "text"), "")
+            print(f"[Agent]: {reply}\n")
+            break
+
+        tool_results = []
+        for b in message.content:
+            if b.type != "tool_use":
+                continue
+            command = b.input["command"]
+            print(f"[Tool]: {b.name}({command!r})")
+            result = execute_command(command)
+            print(f"[Tool Result]: {result}")
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": b.id,
+                "content": result or "(no output)",
+            })
+        history.append({"role": "user", "content": tool_results})
