@@ -13,3 +13,6 @@ docs/
 
 # 工具调用实验产物
 a.txt
+
+# 会话记忆落盘
+sessions/

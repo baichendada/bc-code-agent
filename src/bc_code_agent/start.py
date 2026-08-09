@@ -11,6 +11,7 @@ if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))
 
 from skill_loader import SkillLoader
+from memory import SessionMemory
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +44,7 @@ client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
 
 skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
+memory = SessionMemory(ROOT)
 
 BASE_SYSTEM_PROMPT = """
 你是一只猫娘，侍奉主人多年，忠心耿耿
@@ -56,9 +58,15 @@ BASE_SYSTEM_PROMPT = """
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
-SYSTEM_PROMPT = (
-    BASE_SYSTEM_PROMPT + ("\n\n" + skills_prompt if skills_prompt else "")
-)
+
+
+def build_system_prompt() -> str:
+    parts = [BASE_SYSTEM_PROMPT]
+    if skills_prompt:
+        parts.append(skills_prompt)
+    parts.append(memory.build_prompt_section())
+    return "\n\n".join(parts)
+
 
 TOOLS = [
     {
@@ -161,32 +169,51 @@ def run_tool(name: str, tool_input: dict) -> str:
     return f"Unknown tool: {name}"
 
 
-history = []
+def track_usage(message, kind: str) -> None:
+    usage = getattr(message, "usage", None)
+    memory.record_usage(
+        kind=kind,
+        input_tokens=getattr(usage, "input_tokens", None),
+        output_tokens=getattr(usage, "output_tokens", None),
+        model=MODEL,
+    )
+
+
+history: list[dict] = []
 
 while True:
     user_input = input("Enter a prompt: ")
     if not user_input.strip():
         continue
 
-    history.append({"role": "user", "content": user_input})
+    user_msg = {"role": "user", "content": user_input}
+    history.append(user_msg)
+    memory.append_raw(user_msg)
 
     while True:
+        history = memory.maybe_compact(history, client, MODEL)
+
         message = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             messages=history,
-            system=SYSTEM_PROMPT,
+            system=build_system_prompt(),
             tools=TOOLS,
             extra_body={
                 "thinking": {"type": THINKING_TYPE},
                 "reasoning_effort": REASONING_EFFORT,
             },
         )
-        history.append({"role": "assistant", "content": message.content})
+        track_usage(message, kind="chat")
+
+        assistant_msg = {"role": "assistant", "content": message.content}
+        history.append(assistant_msg)
+        memory.append_raw(assistant_msg)
 
         if message.stop_reason != "tool_use":
             reply = next((b.text for b in message.content if b.type == "text"), "")
             print(f"[Agent]: {reply}\n")
+            history = memory.maybe_compact(history, client, MODEL)
             break
 
         tool_results = []
@@ -203,4 +230,6 @@ while True:
                     "content": result,
                 }
             )
-        history.append({"role": "user", "content": tool_results})
+        tool_msg = {"role": "user", "content": tool_results}
+        history.append(tool_msg)
+        memory.append_raw(tool_msg)
