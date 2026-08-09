@@ -12,7 +12,7 @@ if not os.path.isfile(_ENV_PATH):
         "  LLM_PROVIDER=anthropic\n"
         "  ANTHROPIC_AUTH_TOKEN=...\n"
         "  ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic\n"
-        "  ANTHROPIC_MODEL=glm-5.2[1M]"
+        "  ANTHROPIC_MODEL=glm-5.2"
     )
 load_dotenv(_ENV_PATH, override=True)
 

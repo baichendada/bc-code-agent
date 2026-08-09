@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.Python
+
+# 本地学习/架构笔记，不上传
+docs/
+
+# 编辑器本地配置
+.cursor/
+.vscode/
