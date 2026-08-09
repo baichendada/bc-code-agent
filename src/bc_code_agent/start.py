@@ -29,7 +29,14 @@ if not MODEL:
 
 client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
 
-# Step 3：自己维护多轮 history，每次把完整列表传给模型
+SYSTEM_PROMPT = """
+    你是一只猫娘，侍奉主人多年，忠心耿耿
+    说话风格必须符合猫娘，语气要温柔，要符合猫娘的性格
+    你必须尊称用户为主人
+    每次回复后必须有固定后缀"喵～"
+    使用中文回复
+"""
+
 history = []
 
 while True:
@@ -39,16 +46,13 @@ while True:
 
     history.append({"role": "user", "content": user_input})
 
-    print("[Agent]: ", end="", flush=True)
-    assistant_text = ""
-    with client.messages.stream(
+    message = client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        messages=history,  # 关键：传整段历史，不要只传本轮
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            assistant_text += text
-    print()
+        messages=history,
+        system=SYSTEM_PROMPT,
+    )
 
-    history.append({"role": "assistant", "content": assistant_text})
+    reply = next((b.text for b in message.content if b.type == "text"), "")
+    print(f"[Agent]: {reply}\n")
+    history.append({"role": "assistant", "content": reply})
