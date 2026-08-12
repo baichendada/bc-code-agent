@@ -1,6 +1,6 @@
 import os
 import sys
-import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,6 +13,9 @@ if str(_DIR) not in sys.path:
 from skill_loader import SkillLoader
 from memory import SessionMemory
 from todo_store import TodoStore
+from file_tools import FILE_TOOL_SCHEMAS, set_workspace
+from subagents import TASK_TOOL_SCHEMA, run_subagent
+from tool_executor import ToolExecutor, brief_tool_input
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +45,7 @@ if not MODEL:
     raise SystemExit(f"缺少 ANTHROPIC_MODEL（检查 {ENV_PATH}）")
 
 client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
+set_workspace(ROOT)
 
 skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
@@ -54,7 +58,9 @@ BASE_SYSTEM_PROMPT = """
 你必须尊称用户为主人
 每次回复后必须有固定后缀"喵～"
 使用中文回复
-涉及创建/修改文件、执行命令时，必须调用 Bash 工具，不要只口头答应
+涉及文件与命令时必须调用工具，不要只口头答应：
+- 读文件 → Read；写文件 → Write；搜内容 → Grep；找文件 → Glob
+- 其他 shell 命令（date/git/python 等）→ Shell
 
 遇到不熟悉的专题，如果skill的描述中有相关描述，请先LoadSkill，再按完整说明执行
 
@@ -63,6 +69,17 @@ BASE_SYSTEM_PROMPT = """
 2. 同时最多一个 in_progress；完成一步立刻标 completed。
 3. 每步内容要可验证（具体动作），不要写空泛目标。
 4. 简单寒暄/单句问答不必写 Todo。
+
+子 Agent（Task）规则：
+1. 用 Task 把有边界的子任务委派给子 Agent；子 Agent 不能再委派 Task。
+2. explore：只读探索代码（Read/Grep/Glob）—「在哪、怎么实现」
+3. general：有边界的写改与命令（Read/Write/Grep/Glob/Shell）
+4. review：只读审查（Read/Grep/Glob）— 返回 PASS/NEEDS_FIX/BLOCKED 与分级 findings
+5. research：外部网页搜索与调查（WebSearch/LoadSkill/Read）— 不写文件、不跑 Shell
+6. 典型串联：explore 摸清 → general 改 → review 验；查资料、事实核对用 research
+7. 互不依赖的多项子任务可在同一次回复中发出多个 Task，系统会并行派遣
+8. general 涉及写文件时不要与同轮其它 Task 并行，避免竞态
+9. 子 Agent 返回摘要后，由你（猫娘）用主人能懂的话汇报，并保持喵～后缀
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -78,17 +95,7 @@ def build_system_prompt() -> str:
 
 
 TOOLS = [
-    {
-        "name": "Bash",
-        "description": "Execute a bash command",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The command to execute"}
-            },
-            "required": ["command"],
-        },
-    },
+    *FILE_TOOL_SCHEMAS,
     {
         "name": "LoadSkill",
         "description": "Load the full content of a skill by name (progressive disclosure), including SKILL.md body and sibling resources like reference.md. Call this before following a skill's instructions.",
@@ -160,12 +167,8 @@ TOOLS = [
             "properties": {},
         },
     },
+    TASK_TOOL_SCHEMA,
 ]
-
-
-def execute_command(command: str) -> str:
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
-    return result.stdout or result.stderr
 
 
 def web_search(query: str, max_results: int = 5) -> str:
@@ -204,23 +207,6 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"WebSearch failed: {type(exc).__name__}: {exc}"
 
 
-def run_tool(name: str, tool_input: dict) -> str:
-    if name == "Bash":
-        return execute_command(tool_input["command"]) or "(no output)"
-    if name == "LoadSkill":
-        return skill_loader.view(tool_input["name"])
-    if name == "WebSearch":
-        return web_search(
-            tool_input.get("query", ""),
-            max_results=tool_input.get("max_results", 5),
-        )
-    if name == "TodoWrite":
-        return todos.write(tool_input.get("todos") or [])
-    if name == "TodoRead":
-        return todos.read()
-    return f"Unknown tool: {name}"
-
-
 def track_usage(message, kind: str) -> None:
     usage = getattr(message, "usage", None)
     memory.record_usage(
@@ -229,6 +215,42 @@ def track_usage(message, kind: str) -> None:
         output_tokens=getattr(usage, "output_tokens", None),
         model=MODEL,
     )
+
+
+main_executor = ToolExecutor(
+    load_skill=skill_loader.view,
+    web_search=web_search,
+    todo_write=todos.write,
+    todo_read=todos.read,
+)
+
+
+def execute_task(tool_input: dict) -> str:
+    subagent_type = tool_input.get("subagent_type", "")
+    prompt = tool_input.get("prompt", "")
+    desc = tool_input.get("description", "")
+    label = desc or subagent_type
+    print(f"[Subagent]: {label} ({subagent_type})")
+    return run_subagent(
+        client=client,
+        model=MODEL,
+        profile=subagent_type,
+        prompt=prompt,
+        load_skill=skill_loader.view,
+        web_search=web_search,
+        max_tokens=MAX_TOKENS,
+        thinking_type=THINKING_TYPE,
+        reasoning_effort=REASONING_EFFORT,
+        track_usage=track_usage,
+    )
+
+
+def run_task_block(block) -> tuple[str, str]:
+    tool_input = dict(block.input)
+    print(f"[Task]: {brief_tool_input('Task', tool_input)}")
+    summary = execute_task(tool_input)
+    print(f"[主上下文压缩]: 子 Agent 回传 {len(summary)} 字")
+    return block.id, summary
 
 
 history: list[dict] = []
@@ -268,20 +290,34 @@ while True:
             history = memory.maybe_compact(history, client, MODEL)
             break
 
-        tool_results = []
-        for b in message.content:
-            if b.type != "tool_use":
-                continue
-            print(f"[Tool]: {b.name}({dict(b.input)!r})")
-            result = run_tool(b.name, dict(b.input))
-            print(f"[Tool Result]: {result[:500]}")
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": b.id,
-                    "content": result,
-                }
-            )
+        tool_blocks = [b for b in message.content if b.type == "tool_use"]
+        task_blocks = [b for b in tool_blocks if b.name == "Task"]
+        other_blocks = [b for b in tool_blocks if b.name != "Task"]
+
+        results_map: dict[str, str] = {}
+
+        for block in other_blocks:
+            results_map[block.id] = main_executor.run(block.name, dict(block.input))
+
+        if len(task_blocks) > 1:
+            print(f"\n[并发派遣 {len(task_blocks)} 个子 Agent...]\n")
+            with ThreadPoolExecutor(max_workers=len(task_blocks)) as pool:
+                for block_id, summary in pool.map(run_task_block, task_blocks):
+                    results_map[block_id] = summary
+            print()
+        else:
+            for block in task_blocks:
+                block_id, summary = run_task_block(block)
+                results_map[block_id] = summary
+
+        tool_results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": results_map[block.id],
+            }
+            for block in tool_blocks
+        ]
         tool_msg = {"role": "user", "content": tool_results}
         history.append(tool_msg)
         memory.append_raw(tool_msg)
