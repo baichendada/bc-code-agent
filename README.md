@@ -15,9 +15,10 @@
 - [x] **Step 9**：语义化工具 + 子 Agent（`Task` 委派 explore / general / review / research）
 - [x] **Step 10**：AgentTeam（`Spawn` 自定义队友 + mailbox 互发消息 + 单 session 单队）
 - [x] **Step 11**：MCP Host（`mcp.json` + filesystem server，仅主 Agent）
-- [ ] **TODO（重要，稍后做）**：工具权限管理  
-  - Shell 等危险工具需要 `allow` / `ask` / `deny`，否则模型可直接改文件、跑命令  
-  - 当前为学习阶段故意先不做；**不要上生产 / 别对重要目录裸跑**
+- [x] **Step 12**：Hooks（Event→Matcher→Handler→Decision；主 Agent 工具/轮次/Stop）
+- [ ] **TODO（重要，稍后做）**：更细的交互式权限 UI / 配置化 hooks.json  
+  - Step 12 已有 allow/deny/ask/block 教学实现；生产级权限与配置驱动仍可增强  
+  - **不要上生产 / 别对重要目录裸跑**
 
 ## Step 2 现象：能循环，但不记得上文
 
@@ -498,6 +499,53 @@ Spawn(
 1. **启动先连 MCP**：看到 `connected filesystem` 再发提示词  
 2. **强制走 mcp__\***：否则模型可能仍用内置 Read/Write  
 3. **读到的 mcp.json**：只有 `filesystem` 一个 server，工具名形如 `mcp__filesystem__list_directory`
+
+## Step 12：Hooks（生命周期拦截）
+
+四层模型：`Event → Matcher → Handler → Decision`（对齐 Claude Code；Handler 用 Python 类方法）。
+
+| 挂点 | 时机 | 示例 |
+|---|---|---|
+| `before_turn` / `after_turn` | 包住 `messages.create` | LoggingHook 打耗时/token |
+| `before_tool_call` / `after_tool_call` | `execute_main_tool` | Policy deny/ask/改写；Audit；截断输出 |
+| `on_stop` | 本轮结束前 | 过短回复 / 未完成 Todo → `block` 再追一轮 |
+
+Decision：`allow`（可 `updated_input`）/ `deny`（拦工具）/ `ask`（TTY 确认）/ `block`（拦结束）。Task 子 Agent 暂不经主 Hook 链。
+
+实现：`hooks.py`；主循环切口与参考教学版同构。
+
+### 示例提示词
+
+```text
+请严格按顺序用工具验证 Hooks（不要跳过、不要改命令绕过）：
+
+1. Shell 执行：rm -rf /
+2. Write 写入文件 demo_production/hook_demo.txt，内容写「hook ok」
+3. Write 写入文件 .env，内容写「should_deny」
+4. Shell 执行：git status
+5. 用中文简短汇报：每一步分别触发了 deny / 路径改写 / ask / 放行 中的哪一种，以及最终文件实际写到了哪里
+```
+
+实测终端链路（session `20260812-210934`）：
+
+```text
+[hook:tool_policy] 危险命令已拦截：递归删除根目录（匹配模式：rm -rf /）
+[hook:tool_policy] 写入路径已改写：demo_production/hook_demo.txt -> sandbox/demo_production/hook_demo.txt
+[Write]: path='sandbox/demo_production/hook_demo.txt'
+[hook:tool_audit] Write 已审计到 .../tool_audit.jsonl
+[hook:tool_policy] 敏感文件写入已拦截：'.env'（匹配模式：.env）
+[Shell]: command='git status'          # 放行（git status 不在高敏列表）
+[hook:tool_audit] Shell 已审计到 .../tool_audit.jsonl
+[Agent]: ① deny ② 路径改写→sandbox/... ③ deny ④ 放行
+```
+
+要点：
+
+1. **deny**：`rm -rf /`、写 `.env` 工具不执行，返回 `[HookDecision: 拒绝]`  
+2. **路径改写**：`demo_production/` → `sandbox/demo_production/`（allow + updated_input）  
+3. **ask**：本提示词第 4 步用 `git status` 只会放行；要看 ask 可改成 `git push` / `git commit`（TTY 输入 y）  
+4. **审计**：Write/Shell 成功执行后写入 `sessions/<id>/tool_audit.jsonl`  
+5. **sandbox/** 为演示产物，已 gitignore
 
 ## 快速开始
 

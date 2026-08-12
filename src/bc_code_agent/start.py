@@ -1,7 +1,9 @@
 import os
 import sys
 import atexit
+import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,6 +22,11 @@ from tool_executor import ToolExecutor, brief_tool_input
 from team_store import LEAD_ID, TeamStore
 from team_runtime import TEAM_TOOL_SCHEMAS, AgentTeamManager
 from mcp_hub import McpHub
+from hooks import (
+    HookDecision,
+    build_default_hooks,
+    confirm_hook_decision,
+)
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -102,6 +109,11 @@ MCP 工具规则：
 1. 主 Agent 可用 MCP filesystem 工具（名称形如 mcp__filesystem__list_directory）。
 2. 项目内日常读写仍优先用内置 Read/Write/Grep/Glob；需要 MCP 约定能力（如 directory_tree、search_files）时再用 mcp__*。
 3. MCP 工具暂不开放给 Task 子 Agent / AgentTeam 队友。
+
+Hooks（运行时策略）规则：
+1. 主 Agent 工具调用会经过 before/after hooks（危险 Shell 可 deny；高敏命令 ask；敏感路径 Write 可 deny）。
+2. 若 tool_result 含 [HookDecision: 拒绝/阻止]，不要改路径硬绕过，向主人说明并换安全方案。
+3. Task 子 Agent / 队友暂不走主 Agent 的 Hook 链。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -282,6 +294,49 @@ main_executor = ToolExecutor(
     mcp_dispatch=lead_mcp_dispatch,
 )
 
+HOOKS = build_default_hooks(memory.dir)
+HOOKS.emit("on_session_start", {"session_dir": str(memory.dir)})
+
+
+def execute_main_tool(block) -> str:
+    """主 Agent 工具入口：统一经过 before/after tool hooks。"""
+    name = block.name
+    tool_ctx: dict = {"name": name, "input": dict(block.input)}
+    decision = HOOKS.emit("before_tool_call", tool_ctx, tool_matcher=name)
+    if isinstance(decision, HookDecision):
+        if decision.is_blocking:
+            return decision.to_message()
+        if decision.action == "ask":
+            if not confirm_hook_decision(decision):
+                return HookDecision(
+                    action="deny",
+                    reason=f"用户未确认高敏感操作：{decision.reason}",
+                ).to_message()
+    elif isinstance(decision, str):
+        return decision
+
+    inp = tool_ctx.get("input", dict(block.input))
+    start = time.perf_counter()
+    output = main_executor.run(name, dict(inp))
+
+    if tool_ctx.get("_hook_updated_reason") and isinstance(output, str):
+        output += (
+            "\n[运行时提示] "
+            + str(tool_ctx["_hook_updated_reason"])
+            + "。请以实际执行参数为准，不要再尝试写回原路径。"
+        )
+
+    tool_ctx.update(
+        {
+            "name": name,
+            "input": inp,
+            "output": output,
+            "duration_ms": (time.perf_counter() - start) * 1000,
+        }
+    )
+    HOOKS.emit("after_tool_call", tool_ctx, tool_matcher=name)
+    return str(tool_ctx.get("output", output))
+
 
 def execute_task(tool_input: dict) -> str:
     subagent_type = tool_input.get("subagent_type", "")
@@ -355,7 +410,12 @@ def handle_slash_command(raw: str) -> bool:
 history: list[dict] = []
 
 while True:
-    user_input = input("Enter a prompt: ")
+    try:
+        user_input = input("Enter a prompt: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        break
+
     if not user_input.strip():
         continue
 
@@ -366,14 +426,37 @@ while True:
     history.append(user_msg)
     memory.append_raw(user_msg)
 
+    stop_gate_retries = 0
     while True:
         history = memory.maybe_compact(history, client, MODEL)
+
+        turn_ctx: dict = {
+            "history": history,
+            "model": MODEL,
+            "turn": len(history),
+            "system_prompt": build_system_prompt(),
+        }
+        short = HOOKS.emit("before_turn", turn_ctx)
+        if isinstance(short, HookDecision):
+            if short.is_blocking:
+                msg = short.to_message()
+                assistant_msg = {"role": "assistant", "content": msg}
+                history.append(assistant_msg)
+                memory.append_raw(assistant_msg)
+                print(f"[Agent]: {msg}\n")
+                break
+        elif isinstance(short, str):
+            assistant_msg = {"role": "assistant", "content": short}
+            history.append(assistant_msg)
+            memory.append_raw(assistant_msg)
+            print(f"[Agent]: {short}\n")
+            break
 
         message = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             messages=history,
-            system=build_system_prompt(),
+            system=turn_ctx.get("system_prompt", build_system_prompt()),
             tools=TOOLS,
             extra_body={
                 "thinking": {"type": THINKING_TYPE},
@@ -381,6 +464,8 @@ while True:
             },
         )
         track_usage(message, kind="chat")
+        turn_ctx.update({"message": message, "usage": getattr(message, "usage", None)})
+        HOOKS.emit("after_turn", turn_ctx)
 
         assistant_msg = {"role": "assistant", "content": message.content}
         history.append(assistant_msg)
@@ -388,6 +473,33 @@ while True:
 
         if message.stop_reason != "tool_use":
             reply = next((b.text for b in message.content if b.type == "text"), "")
+            stop_ctx = {
+                "reply": reply,
+                "history": history,
+                "todos": [asdict(t) for t in todos.items],
+                "retry": stop_gate_retries,
+            }
+            gate = HOOKS.emit("on_stop", stop_ctx)
+            if (
+                isinstance(gate, HookDecision)
+                and gate.is_blocking
+                and stop_gate_retries < 1
+            ):
+                print(f"[hook:stop_quality_gate] {gate.reason}")
+                reminder = {
+                    "role": "user",
+                    "content": (
+                        "Stop Hook 阻止本轮结束："
+                        + gate.reason
+                        + "\n请继续完成未完成的步骤。若确实无法继续，请说明原因。"
+                    ),
+                }
+                history.append(reminder)
+                memory.append_raw(reminder)
+                stop_gate_retries += 1
+                continue
+
+            reply = stop_ctx.get("reply", reply)
             print(f"[Agent]: {reply}\n")
             history = memory.maybe_compact(history, client, MODEL)
             break
@@ -399,7 +511,7 @@ while True:
         results_map: dict[str, str] = {}
 
         for block in other_blocks:
-            results_map[block.id] = main_executor.run(block.name, dict(block.input))
+            results_map[block.id] = execute_main_tool(block)
 
         if len(task_blocks) > 1:
             print(f"\n[并发派遣 {len(task_blocks)} 个子 Agent...]\n")
