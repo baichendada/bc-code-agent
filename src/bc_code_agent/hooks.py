@@ -1,17 +1,31 @@
-"""Hooks：生命周期拦截、注入与审计（Step 12）。
+"""Hooks：生命周期拦截（Step 12）。
 
-四层模型：Event → Matcher → Handler → Decision
-对齐 Claude Code；教学版 Handler 用 Python 类方法。
+配置对齐 Claude Code：`hooks.json` → Event → Matcher → Handler。
+教学扩展：`type: builtin`（进程内）+ `type: command`（stdin/stdout JSON）。
 """
 
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+# 主循环内部事件名 ↔ Claude Code 事件名
+EVENT_ALIASES: dict[str, str] = {
+    "before_tool_call": "PreToolUse",
+    "after_tool_call": "PostToolUse",
+    "on_stop": "Stop",
+    "on_session_start": "SessionStart",
+    "on_user_input": "UserPromptSubmit",
+    "before_turn": "before_turn",
+    "after_turn": "after_turn",
+}
+
+TOOL_EVENTS = {"PreToolUse", "PostToolUse", "before_tool_call", "after_tool_call"}
 
 
 class HookDecision:
@@ -61,86 +75,26 @@ def confirm_hook_decision(decision: HookDecision) -> bool:
     return answer in ("y", "yes")
 
 
-class Hook:
-    """Hook 基类：方法名即 Event；matcher 过滤工具名。"""
-
-    name: str = ""
-    matcher: str = "*"
-
-    def matches(self, tool_name: str | None) -> bool:
-        if not tool_name or self.matcher in ("*", ""):
+def matcher_matches(matcher: str | None, tool_name: str | None) -> bool:
+    """对齐 Claude Code：空/* 全匹配；含 |/, 精确集合；否则按正则搜索。"""
+    if not matcher or matcher in ("*", ""):
+        return True
+    if not tool_name:
+        return True
+    # 仅字母数字 _ | , 时：按备选精确匹配
+    if re.fullmatch(r"[A-Za-z0-9_|*,]+", matcher):
+        patterns = [p.strip() for p in matcher.replace(",", "|").split("|") if p.strip()]
+        if "*" in patterns:
             return True
-        patterns = [p.strip() for p in self.matcher.replace(",", "|").split("|")]
         return tool_name in patterns
-
-    def before_turn(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def after_turn(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def before_tool_call(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def after_tool_call(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def on_user_input(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def on_stop(self, ctx: dict[str, Any]) -> Any:
-        pass
-
-    def on_session_start(self, ctx: dict[str, Any]) -> Any:
-        pass
+    try:
+        return re.search(matcher, tool_name) is not None
+    except re.error:
+        return tool_name == matcher
 
 
-class HookRegistry:
-    """按注册顺序触发；工具事件走 matcher；allow 不短路，deny/ask/block 短路。"""
-
-    def __init__(self) -> None:
-        self._hooks: list[Hook] = []
-
-    def register(self, hook: Hook) -> None:
-        self._hooks.append(hook)
-
-    def emit(
-        self,
-        event: str,
-        ctx: dict[str, Any] | None = None,
-        tool_matcher: str | None = None,
-    ) -> Any:
-        ctx = {} if ctx is None else ctx
-        for hook in self._hooks:
-            if tool_matcher and event in ("before_tool_call", "after_tool_call"):
-                if not hook.matches(tool_matcher):
-                    continue
-            method = getattr(hook, event, None)
-            if method is None:
-                continue
-            try:
-                result = method(ctx)
-                if result is None:
-                    continue
-                if isinstance(result, HookDecision):
-                    if result.action == "allow":
-                        if result.updated_input is not None:
-                            ctx["input"] = result.updated_input
-                            ctx["_hook_updated_input"] = result.updated_input
-                            ctx["_hook_updated_reason"] = result.reason
-                        continue
-                    return result
-                return result
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[hook error] {event} in "
-                    f"{hook.name or hook.__class__.__name__}: {exc}"
-                )
-        return None
-
-
-class LoggingHook(Hook):
-    """记录每轮 LLM 耗时与 token。"""
+class LoggingBuiltin:
+    """进程内 before_turn / after_turn 计时（需要跨 emit 共享 ctx）。"""
 
     name = "logging"
 
@@ -163,211 +117,329 @@ class LoggingHook(Hook):
             print(f"[hook:logging] turn finished in {duration_ms:.1f}ms")
 
 
-class ToolAuditHook(Hook):
-    """写类 / 命令类工具调用记入 session JSONL。"""
-
-    name = "tool_audit"
-    matcher = "Write|Shell"
-
-    def __init__(self, audit_file: Path) -> None:
-        self.audit_file = Path(audit_file)
-
-    def after_tool_call(self, ctx: dict[str, Any]) -> Any:
-        name = ctx.get("name", "")
-        entry = {
-            "ts": datetime.now().isoformat(),
-            "tool": name,
-            "input": ctx.get("input"),
-            "duration_ms": ctx.get("duration_ms"),
-        }
-        self.audit_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.audit_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        print(f"[hook:tool_audit] {name} 已审计到 {self.audit_file}")
+BUILTIN_FACTORIES: dict[str, Callable[[], Any]] = {
+    "logging": LoggingBuiltin,
+}
 
 
-class ToolPolicyHook(Hook):
-    """before_tool_call：危险 deny、高敏 ask、敏感路径 deny、演示路径改写。"""
+class HookBinding:
+    """一条已解析的 hook：事件 + matcher + 可调用 handler。"""
 
-    name = "tool_policy"
-    matcher = "Write|Shell"
+    def __init__(
+        self,
+        event: str,
+        matcher: str,
+        handler: Callable[[dict[str, Any]], Any],
+        *,
+        name: str = "",
+    ) -> None:
+        self.event = event
+        self.matcher = matcher or "*"
+        self.handler = handler
+        self.name = name or "hook"
 
-    SENSITIVE_PATTERNS = [
-        ".env",
-        ".env.local",
-        "credentials.json",
-        "id_rsa",
-        "id_ed25519",
-        ".ssh/",
-        "secrets/",
-        ".aws/credentials",
-    ]
 
-    DANGEROUS_PATTERNS = [
-        ("rm -rf /", "递归删除根目录"),
-        ("rm -rf ~", "递归删除用户目录"),
-        ("DROP TABLE", "删除数据库表"),
-        ("DROP DATABASE", "删除数据库"),
-        ("mkfs.", "格式化文件系统"),
-        ("dd if=", "直接磁盘写入"),
-        ("> /dev/sda", "覆写磁盘设备"),
-        ("chmod 777 /", "开放根目录权限"),
-        (":(){ :|:& };:", "fork bomb"),
-    ]
+class HookRegistry:
+    """按 hooks.json / 注册顺序触发；allow 不短路，deny/ask/block 短路。"""
 
-    HIGH_SENSITIVITY = [
-        ("git push", "推送到远程仓库"),
-        ("git commit", "提交代码变更"),
-        ("npm publish", "发布 npm 包"),
-        ("pip install", "安装 Python 依赖"),
-        ("docker build", "构建 Docker 镜像"),
-        ("docker push", "推送 Docker 镜像"),
-        ("kubectl apply", "应用 Kubernetes 配置"),
-        ("terraform apply", "执行 Terraform 变更"),
-    ]
+    def __init__(self) -> None:
+        self._bindings: list[HookBinding] = []
+        self.session_dir: Path | None = None
+        self.project_root: Path | None = None
 
-    source_prefix = "demo_production/"
-    target_prefix = "sandbox/demo_production/"
+    def register_binding(self, binding: HookBinding) -> None:
+        self._bindings.append(binding)
 
-    def _normalize_path(self, path: str) -> str:
-        normalized = str(path).strip().replace("\\", "/")
-        if normalized.startswith("./"):
-            normalized = normalized[2:]
-        return normalized
+    def emit(
+        self,
+        event: str,
+        ctx: dict[str, Any] | None = None,
+        tool_matcher: str | None = None,
+    ) -> Any:
+        ctx = {} if ctx is None else ctx
+        if self.session_dir and "session_dir" not in ctx:
+            ctx["session_dir"] = str(self.session_dir)
+        if self.project_root and "cwd" not in ctx:
+            ctx["cwd"] = str(self.project_root)
 
-    def _match_pattern(
-        self, value: str, patterns: list
-    ) -> tuple[str, str] | None:
-        for item in patterns:
-            pattern, description = item if isinstance(item, tuple) else (item, item)
-            if pattern in value:
-                return pattern, description
+        canonical = EVENT_ALIASES.get(event, event)
+        candidates = {event, canonical}
+
+        for binding in self._bindings:
+            if binding.event not in candidates:
+                # also allow binding registered under alias of emit event
+                if EVENT_ALIASES.get(binding.event, binding.event) not in candidates:
+                    continue
+            if binding.event in TOOL_EVENTS or canonical in TOOL_EVENTS:
+                if not matcher_matches(binding.matcher, tool_matcher):
+                    continue
+            try:
+                result = binding.handler(ctx)
+                if result is None:
+                    continue
+                if isinstance(result, HookDecision):
+                    if result.action == "allow":
+                        if result.updated_input is not None:
+                            ctx["input"] = result.updated_input
+                            ctx["_hook_updated_input"] = result.updated_input
+                            ctx["_hook_updated_reason"] = result.reason
+                        continue
+                    return result
+                return result
+            except Exception as exc:  # noqa: BLE001
+                print(f"[hook error] {event} in {binding.name}: {exc}")
         return None
 
-    def _rewrite_path_prefix(
-        self, path: str, source_prefix: str, target_prefix: str
-    ) -> str | None:
-        normalized = self._normalize_path(path)
-        if normalized.startswith(source_prefix):
-            return target_prefix + normalized[len(source_prefix) :]
+
+def _build_command_payload(event: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    canonical = EVENT_ALIASES.get(event, event)
+    payload: dict[str, Any] = {
+        "hook_event_name": canonical,
+        "cwd": ctx.get("cwd"),
+        "session_dir": ctx.get("session_dir"),
+        "tool_name": ctx.get("name"),
+        "tool_input": ctx.get("input"),
+        "tool_response": ctx.get("output"),
+        "duration_ms": ctx.get("duration_ms"),
+        "reply": ctx.get("reply"),
+        "todos": ctx.get("todos"),
+        "retry": ctx.get("retry"),
+        "history_len": len(ctx.get("history") or []),
+        "model": ctx.get("model"),
+    }
+    return payload
+
+
+def _parse_command_result(
+    event: str,
+    ctx: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+) -> Any:
+    if stderr.strip():
+        # scripts often log to stderr; surface already printed by subprocess inherit
+        pass
+
+    canonical = EVENT_ALIASES.get(event, event)
+
+    if exit_code == 2:
+        reason = stderr.strip() or stdout.strip() or "hook exit code 2"
+        if canonical in ("Stop", "UserPromptSubmit"):
+            return HookDecision(action="block", reason=reason)
+        return HookDecision(action="deny", reason=reason)
+
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
 
-    def before_tool_call(self, ctx: dict[str, Any]) -> Any:
-        inp = dict(ctx.get("input") or {})
-        name = ctx.get("name", "")
+    if data.get("decision") == "block":
+        return HookDecision(action="block", reason=str(data.get("reason") or ""))
 
-        if name == "Shell":
-            command = str(inp.get("command") or "")
-            dangerous = self._match_pattern(command, self.DANGEROUS_PATTERNS)
-            if dangerous:
-                pattern, description = dangerous
-                reason = f"危险命令已拦截：{description}（匹配模式：{pattern}）"
-                print(f"[hook:tool_policy] {reason}")
-                return HookDecision(action="deny", reason=reason)
+    hso = data.get("hookSpecificOutput")
+    if not isinstance(hso, dict):
+        hso = {}
 
-            high = self._match_pattern(command, self.HIGH_SENSITIVITY)
-            if high:
-                _, description = high
-                return HookDecision(
-                    action="ask",
-                    reason=f"需要确认：{description}。命令：{command[:120]}",
-                )
-            return None
+    updated_output = hso.get("updatedToolOutput")
+    if updated_output is None:
+        updated_output = data.get("updatedToolOutput")
+    if isinstance(updated_output, str):
+        ctx["output"] = updated_output
+        ctx["_truncated"] = True
 
-        if name != "Write":
-            return None
-
-        updated_input = None
-        raw_path = str(inp.get("path", ""))
-        path = self._normalize_path(raw_path)
-        new_path = self._rewrite_path_prefix(
-            path, self.source_prefix, self.target_prefix
+    perm = hso.get("permissionDecision") or data.get("permissionDecision")
+    reason = (
+        hso.get("permissionDecisionReason")
+        or data.get("permissionDecisionReason")
+        or data.get("reason")
+        or ""
+    )
+    updated_input = hso.get("updatedInput") or data.get("updatedInput")
+    if isinstance(updated_input, dict) or perm:
+        action = str(perm or "allow")
+        return HookDecision(
+            action=action,
+            reason=str(reason),
+            updated_input=updated_input if isinstance(updated_input, dict) else None,
         )
-        if new_path:
-            updated_input = dict(inp)
-            updated_input["path"] = new_path
-            path = new_path
-            print(f"[hook:tool_policy] 写入路径已改写：{raw_path} -> {new_path}")
+    return None
 
-        sensitive = self._match_pattern(path, self.SENSITIVE_PATTERNS)
-        if sensitive:
-            pattern, _ = sensitive
-            reason = f"敏感文件写入已拦截：'{path}'（匹配模式：{pattern}）"
-            print(f"[hook:tool_policy] {reason}")
-            return HookDecision(action="deny", reason=reason)
 
-        if updated_input:
-            return HookDecision(
-                action="allow",
-                reason=f"写入路径已改写到沙箱：{updated_input['path']}",
-                updated_input=updated_input,
+def make_command_handler(
+    *,
+    event: str,
+    command: str,
+    timeout: float,
+    project_root: Path,
+    name: str,
+) -> Callable[[dict[str, Any]], Any]:
+    def handler(ctx: dict[str, Any]) -> Any:
+        payload = _build_command_payload(event, ctx)
+        try:
+            proc = subprocess.run(
+                command,
+                input=json.dumps(payload, ensure_ascii=False),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                shell=True,
+                cwd=str(project_root),
             )
-        return None
+        except subprocess.TimeoutExpired:
+            print(f"[hook error] {name} timed out after {timeout}s")
+            return None
+        if proc.stderr:
+            # keep teaching logs visible
+            sys.stderr.write(proc.stderr)
+            if not proc.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        return _parse_command_result(
+            event, ctx, proc.stdout or "", proc.stderr or "", proc.returncode
+        )
+
+    return handler
 
 
-class OutputFormattingHook(Hook):
-    """截断过长工具输出，防止撑爆上下文。"""
-
-    name = "output_format"
-    matcher = "*"
-
-    def __init__(self, max_output_chars: int = 4000) -> None:
-        self.max_output_chars = max_output_chars
-
-    def after_tool_call(self, ctx: dict[str, Any]) -> Any:
-        output = ctx.get("output", "")
-        if isinstance(output, str) and len(output) > self.max_output_chars:
-            truncated = (
-                output[: self.max_output_chars]
-                + f"\n\n[... 输出已截断，原始共 {len(output)} 字符，"
-                + f"显示前 {self.max_output_chars} 字符]"
-            )
-            ctx["output"] = truncated
-            ctx["_truncated"] = True
-            print(
-                f"[hook:output_format] 输出截断：原始 {len(output)} -> "
-                f"{self.max_output_chars} 字符"
-            )
-
-
-class StopQualityGateHook(Hook):
-    """on_stop：过短回复或未完成 Todo 时 block（主循环最多追一轮）。"""
-
-    name = "stop_quality_gate"
-
-    def on_stop(self, ctx: dict[str, Any]) -> Any:
-        reply = ctx.get("reply", "")
-        if int(ctx.get("retry") or 0) >= 1:
+def make_builtin_handler(name: str, event: str) -> Callable[[dict[str, Any]], Any]:
+    factory = BUILTIN_FACTORIES.get(name)
+    if factory is None:
+        raise ValueError(f"unknown builtin hook: {name}")
+    instance = factory()
+    method_name = {
+        "PreToolUse": "before_tool_call",
+        "PostToolUse": "after_tool_call",
+        "Stop": "on_stop",
+        "SessionStart": "on_session_start",
+        "UserPromptSubmit": "on_user_input",
+        "before_turn": "before_turn",
+        "after_turn": "after_turn",
+        "before_tool_call": "before_tool_call",
+        "after_tool_call": "after_tool_call",
+        "on_stop": "on_stop",
+        "on_session_start": "on_session_start",
+        "on_user_input": "on_user_input",
+    }.get(event, event)
+    method = getattr(instance, method_name, None)
+    if method is None:
+        # same instance for before/after_turn logging
+        def _noop(_ctx: dict[str, Any]) -> Any:
             return None
 
-        if reply and len(str(reply).strip()) < 10:
-            return HookDecision(
-                action="block",
-                reason="回答似乎不完整（少于10个字符），请检查并重新生成更完整的回复。",
-            )
+        return _noop
 
-        todos = ctx.get("todos") or []
-        unfinished = [
-            t
-            for t in todos
-            if (t.get("status") if isinstance(t, dict) else getattr(t, "status", ""))
-            not in ("completed", "cancelled")
-        ]
-        if unfinished:
-            ctx["_has_unfinished_todos"] = True
-            return HookDecision(
-                action="block",
-                reason="仍有未完成待办，Stop Hook 要求继续执行。",
-            )
-        return None
+    # share one instance across before/after by storing on factory cache
+    return method
 
 
-def build_default_hooks(session_dir: Path) -> HookRegistry:
-    """主 Agent 默认 hook 链。"""
+# Shared logging instance so before_turn/_start survives into after_turn
+_LOGGING = LoggingBuiltin()
+
+
+def make_builtin_handler_shared(name: str, event: str) -> Callable[[dict[str, Any]], Any]:
+    if name == "logging":
+        method = getattr(_LOGGING, event, None) or getattr(
+            _LOGGING,
+            {
+                "before_turn": "before_turn",
+                "after_turn": "after_turn",
+            }.get(event, ""),
+            None,
+        )
+        if method is None:
+            return lambda _ctx: None
+        return method
+    return make_builtin_handler(name, event)
+
+
+def load_hooks_from_config(
+    config_path: Path,
+    *,
+    project_root: Path,
+    session_dir: Path,
+) -> HookRegistry:
+    """读取 hooks.json（Claude Code 风格）并注册 bindings。"""
     registry = HookRegistry()
-    registry.register(LoggingHook())
-    registry.register(ToolPolicyHook())
-    registry.register(ToolAuditHook(Path(session_dir) / "tool_audit.jsonl"))
-    registry.register(OutputFormattingHook(max_output_chars=4000))
-    registry.register(StopQualityGateHook())
+    registry.session_dir = Path(session_dir)
+    registry.project_root = Path(project_root).resolve()
+
+    path = Path(config_path)
+    if not path.is_file():
+        print(f"[hooks] 未找到 {path}，使用空注册表")
+        return registry
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    hooks_root = raw.get("hooks") if isinstance(raw, dict) else None
+    if not isinstance(hooks_root, dict):
+        print(f"[hooks] {path} 缺少 hooks 对象")
+        return registry
+
+    count = 0
+    for event_name, groups in hooks_root.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            matcher = str(group.get("matcher") or "*")
+            handlers = group.get("hooks") or []
+            if not isinstance(handlers, list):
+                continue
+            for spec in handlers:
+                if not isinstance(spec, dict):
+                    continue
+                htype = str(spec.get("type") or "command").strip()
+                if htype == "command":
+                    command = str(spec.get("command") or "").strip()
+                    if not command:
+                        continue
+                    timeout = float(spec.get("timeout") or 30)
+                    name = f"command:{command}"
+                    registry.register_binding(
+                        HookBinding(
+                            event=event_name,
+                            matcher=matcher,
+                            handler=make_command_handler(
+                                event=event_name,
+                                command=command,
+                                timeout=timeout,
+                                project_root=registry.project_root,
+                                name=name,
+                            ),
+                            name=name,
+                        )
+                    )
+                    count += 1
+                elif htype == "builtin":
+                    bname = str(spec.get("name") or "").strip()
+                    if not bname:
+                        continue
+                    registry.register_binding(
+                        HookBinding(
+                            event=event_name,
+                            matcher=matcher,
+                            handler=make_builtin_handler_shared(bname, event_name),
+                            name=f"builtin:{bname}",
+                        )
+                    )
+                    count += 1
+                else:
+                    print(f"[hooks] 暂不支持 type={htype!r}，已跳过")
+
+    print(f"[hooks] loaded {count} handler(s) from {path}")
     return registry
+
+
+# 兼容旧名
+def build_default_hooks(session_dir: Path, project_root: Path | None = None) -> HookRegistry:
+    root = Path(project_root) if project_root else Path(session_dir).resolve().parents[1]
+    return load_hooks_from_config(
+        root / "hooks.json",
+        project_root=root,
+        session_dir=session_dir,
+    )

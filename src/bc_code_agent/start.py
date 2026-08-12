@@ -24,8 +24,8 @@ from team_runtime import TEAM_TOOL_SCHEMAS, AgentTeamManager
 from mcp_hub import McpHub
 from hooks import (
     HookDecision,
-    build_default_hooks,
     confirm_hook_decision,
+    load_hooks_from_config,
 )
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
@@ -294,7 +294,11 @@ main_executor = ToolExecutor(
     mcp_dispatch=lead_mcp_dispatch,
 )
 
-HOOKS = build_default_hooks(memory.dir)
+HOOKS = load_hooks_from_config(
+    ROOT / "hooks.json",
+    project_root=ROOT,
+    session_dir=memory.dir,
+)
 HOOKS.emit("on_session_start", {"session_dir": str(memory.dir)})
 
 
