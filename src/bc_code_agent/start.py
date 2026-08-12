@@ -1,5 +1,6 @@
 import os
 import sys
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from todo_store import TodoStore
 from file_tools import FILE_TOOL_SCHEMAS, set_workspace
 from subagents import TASK_TOOL_SCHEMA, run_subagent
 from tool_executor import ToolExecutor, brief_tool_input
+from team_store import LEAD_ID, TeamStore
+from team_runtime import TEAM_TOOL_SCHEMAS, AgentTeamManager
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +54,7 @@ skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
 memory = SessionMemory(ROOT)
 todos = TodoStore(memory.dir)
+team_store = TeamStore(memory.dir)
 
 BASE_SYSTEM_PROMPT = """
 你是一只猫娘，侍奉主人多年，忠心耿耿
@@ -80,6 +84,17 @@ BASE_SYSTEM_PROMPT = """
 7. 互不依赖的多项子任务可在同一次回复中发出多个 Task，系统会并行派遣
 8. general 涉及写文件时不要与同轮其它 Task 并行，避免竞态
 9. 子 Agent 返回摘要后，由你（猫娘）用主人能懂的话汇报，并保持喵～后缀
+
+AgentTeam（长期协作）规则：
+1. 仅当任务需要多轮、多人互相对齐时用团队；一次性小事用 Task，不要 Spawn。
+2. 本会话同时最多一个队伍；Spawn 会隐式建队或向现有队伍加人；换阵容必须先 DisbandTeam。
+3. Spawn 时自定义队友 profile（name/role/system/tools），不要假设固定 explore/general 身份。
+4. 队友可用 Read/Write/Grep/Glob/WebSearch/LoadSkill + 消息工具；禁止 Shell；不能改 Todo。
+5. 只有你（主 Agent）能 TodoWrite/TodoRead、Spawn、DisbandTeam。
+6. 用 SendMessage / Broadcast 协作；用 ListTeammates / ReadInbox(who=lead) 看队友回信与状态。
+7. 队友之间可以互发消息；你负责最终向主人汇报，保持猫娘口吻与喵～后缀。
+8. 队友 status=busy 时不要连续空转 ListTeammates；最多查 1～2 次，或 ReadInbox 看 lead 未读，或发一条催促后向主人说明「还在等」；主人侧也可用 /listTeam、/inbox。
+9. 团队交付完成后先 DisbandTeam 停掉队友，再向主人做最终汇报，避免队友后台继续空转。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -91,6 +106,8 @@ def build_system_prompt() -> str:
         parts.append(skills_prompt)
     parts.append(memory.build_prompt_section())
     parts.append(todos.prompt_section())
+    if team_store.has_active_team():
+        parts.append("# Active AgentTeam\n" + team_store.format_members_report())
     return "\n\n".join(parts)
 
 
@@ -168,6 +185,7 @@ TOOLS = [
         },
     },
     TASK_TOOL_SCHEMA,
+    *TEAM_TOOL_SCHEMAS,
 ]
 
 
@@ -217,11 +235,31 @@ def track_usage(message, kind: str) -> None:
     )
 
 
+team = AgentTeamManager(
+    team_store,
+    client=client,
+    model=MODEL,
+    max_tokens=MAX_TOKENS,
+    thinking_type=THINKING_TYPE,
+    reasoning_effort=REASONING_EFFORT,
+    load_skill=skill_loader.view,
+    web_search=web_search,
+    track_usage=track_usage,
+)
+atexit.register(team.shutdown)
+
+
+def lead_team_dispatch(name: str, tool_input: dict) -> str:
+    result = team.run_team_tool(name, tool_input, caller_id=LEAD_ID)
+    return result if result is not None else f"Unknown team tool: {name}"
+
+
 main_executor = ToolExecutor(
     load_skill=skill_loader.view,
     web_search=web_search,
     todo_write=todos.write,
     todo_read=todos.read,
+    team_dispatch=lead_team_dispatch,
 )
 
 
@@ -253,11 +291,55 @@ def run_task_block(block) -> tuple[str, str]:
     return block.id, summary
 
 
+def handle_slash_command(raw: str) -> bool:
+    """处理 /listTeam、/inbox 等本地命令；已处理则返回 True（不进入 LLM）。"""
+    line = raw.strip()
+    if not line.startswith("/"):
+        return False
+
+    cmd, _, rest = line.partition(" ")
+    cmd_lower = cmd.lower()
+
+    if cmd_lower == "/listteam":
+        print(team_store.format_members_report())
+        print()
+        return True
+
+    if cmd_lower == "/inbox":
+        rest = rest.strip()
+        if not rest:
+            print(
+                "用法: /inbox <队友 id 或名字> <消息内容>\n"
+                "示例: /inbox 调研官 请查杭州本周末天气要点\n"
+            )
+            return True
+        to, _, content = rest.partition(" ")
+        to = to.strip()
+        content = content.strip()
+        if not to or not content:
+            print(
+                "用法: /inbox <队友 id 或名字> <消息内容>\n"
+                "示例: /inbox 调研官 请查杭州本周末天气要点\n"
+            )
+            return True
+        if not team_store.has_active_team():
+            print("当前没有 active team。请先在对话里让主 Agent Spawn 队友。\n")
+            return True
+        result = team.send_message(LEAD_ID, to, content)
+        print(f"[Cmd] {result}\n")
+        return True
+
+    return False
+
+
 history: list[dict] = []
 
 while True:
     user_input = input("Enter a prompt: ")
     if not user_input.strip():
+        continue
+
+    if handle_slash_command(user_input):
         continue
 
     user_msg = {"role": "user", "content": user_input}

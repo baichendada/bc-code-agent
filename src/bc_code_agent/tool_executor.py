@@ -17,6 +17,12 @@ _BRIEF_KEYS: dict[str, tuple[str, ...]] = {
     "TodoWrite": (),
     "TodoRead": (),
     "Task": ("subagent_type", "description"),
+    "Spawn": ("name", "role"),
+    "DisbandTeam": (),
+    "ListTeammates": (),
+    "SendMessage": ("to",),
+    "Broadcast": (),
+    "ReadInbox": ("who", "unread_only", "mark_read"),
 }
 
 
@@ -55,6 +61,7 @@ class ToolExecutor:
         web_search: Callable[..., str],
         todo_write: Callable[[list], str] | None = None,
         todo_read: Callable[[], str] | None = None,
+        team_dispatch: Callable[[str, dict], str] | None = None,
         log: bool = True,
     ) -> None:
         self.allowed = allowed
@@ -63,6 +70,7 @@ class ToolExecutor:
         self.web_search = web_search
         self.todo_write = todo_write
         self.todo_read = todo_read
+        self.team_dispatch = team_dispatch
         self.log = log
 
     def _tag(self, name: str) -> str:
@@ -110,6 +118,21 @@ class ToolExecutor:
             if self.todo_read is None:
                 return "Tool not allowed: TodoRead"
             result = self.todo_read()
+            if self.log:
+                print(f"{self._tag('result')}: {result[:500]}")
+            return result
+
+        if name in {
+            "Spawn",
+            "DisbandTeam",
+            "ListTeammates",
+            "SendMessage",
+            "Broadcast",
+            "ReadInbox",
+        }:
+            if self.team_dispatch is None:
+                return f"Tool not allowed: {name}"
+            result = self.team_dispatch(name, tool_input)
             if self.log:
                 print(f"{self._tag('result')}: {result[:500]}")
             return result

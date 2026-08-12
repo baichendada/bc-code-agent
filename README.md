@@ -13,6 +13,7 @@
 - [x] **Step 7**：三层记忆 + 压缩（history≥50 触发，保留近 6 条）+ Token 计量
 - [x] **Step 8**：Todo 任务清单（`TodoWrite` / `TodoRead`，防复杂任务迷路）
 - [x] **Step 9**：语义化工具 + 子 Agent（`Task` 委派 explore / general / review / research）
+- [x] **Step 10**：AgentTeam（`Spawn` 自定义队友 + mailbox 互发消息 + 单 session 单队）
 - [ ] **TODO（重要，稍后做）**：工具权限管理  
   - Shell 等危险工具需要 `allow` / `ask` / `deny`，否则模型可直接改文件、跑命令  
   - 当前为学习阶段故意先不做；**不要上生产 / 别对重要目录裸跑**
@@ -417,6 +418,44 @@ Step 5 的单一 `Bash` 拆成语义工具，便于按 profile 做 least-privile
 3. **review 闭环**：`NEEDS_FIX` 后 general 再改 md  
 4. **网络与代码分离**：`ddgs` 连境外搜索引擎超时属环境问题；子 Agent 架构与委派链路正常  
 5. 生成物 `杭州周末攻略.md` 为本地演示产物（已 gitignore），不入库  
+
+## Step 10：AgentTeam（长期协作）
+
+短平快继续用 `Task`；需要多轮、队友互相对齐时用 **AgentTeam**。
+
+| 项 | 说明 |
+|---|---|
+| 建队 | 无显式 CreateTeam；主 Agent `Spawn` 隐式建队或加人 |
+| 单队 | 每个 session 同时最多一个 active team；换阵容先 `DisbandTeam` |
+| 身份 | 主 Agent 填 profile 模板（`name` / `role` / `system` / `tools[]`），落盘到 `sessions/<id>/team/` |
+| 队友工具 | 可选 Read/Write/Grep/Glob/WebSearch/LoadSkill；**禁止 Shell**；消息工具自动附带 |
+| 主专属 | `Spawn` / `DisbandTeam` / `TodoWrite` / `TodoRead` / `Task` |
+| 消息 | `SendMessage`（点对点，含队友互发）/ `Broadcast` / `ReadInbox` / `ListTeammates` |
+| 唤醒 | 每个队友后台线程：inbox 有未读则跑 LLM loop，否则 `sleep(1)`（不烧 token） |
+
+实现：`team_store.py`、`team_runtime.py`。
+
+### Spawn 示例
+
+```text
+Spawn(
+  name="调研官",
+  role="查外网事实",
+  system="先 LoadSkill(web-search)，再 WebSearch；结论附来源；向 lead 汇报",
+  tools=["WebSearch", "LoadSkill", "Read"],
+  brief="请查杭州本周末天气要点"
+)
+```
+
+终端可见：`[Team] Spawn ...`、`[Team] wake ...`、`[队·调研官·WebSearch]`、`[Team] msg ... → lead`。
+
+要点：
+
+1. **Task vs Team**：一次性委派用 Task；长期协作、要互聊用 Spawn  
+2. **自定义身份**：不强制 explore/general；模板写在 Spawn description 里供参考  
+3. **Todo 仍只归主 Agent**：队友用消息汇报进度，由猫娘更新 Todo  
+4. **斜杠命令**：`/listTeam` 看队伍；`/inbox <队友> <内容>` 以 lead 身份发消息（不经 LLM）  
+5. **体验约定**：busy 时少轮询；交付后 `DisbandTeam`；`ReadInbox who=self` 可读自己的箱；已 `SendMessage` 给 lead 则不再 auto-report  
 
 ## 快速开始
 
