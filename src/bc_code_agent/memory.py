@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-COMPACT_THRESHOLD = 20
+COMPACT_THRESHOLD = 50
 KEEP_RECENT = 6
 MID_KEEP_SEGMENTS = 5
 
@@ -168,7 +168,7 @@ class SessionMemory:
         return "\n".join(parts).rstrip() + "\n"
 
     def maybe_compact(self, history: list[dict[str, Any]], client: Any, model: str) -> list[dict[str, Any]]:
-        """history 条数 >= 20 则压缩；成功后返回裁剪后的 history（保留最近 6 条）。"""
+        """history 条数 >= COMPACT_THRESHOLD 则压缩；成功后返回裁剪后的 history（保留最近 6 条）。"""
         if len(history) < COMPACT_THRESHOLD:
             return history
 

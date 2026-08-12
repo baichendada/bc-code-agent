@@ -10,7 +10,7 @@
 - [x] **Step 4**：`system` 提示词（人设 / 行为约束）
 - [x] **Step 5**：工具调用（`tools` + `tool_use` / `tool_result` 循环）
 - [x] **Step 6**：Skill 系统（渐进式披露 + `LoadSkill` + 示例 `web-search`）
-- [x] **Step 7**：三层记忆 + 压缩（history≥20 触发，保留近 6 条）+ Token 计量
+- [x] **Step 7**：三层记忆 + 压缩（history≥50 触发，保留近 6 条）+ Token 计量
 - [x] **Step 8**：Todo 任务清单（`TodoWrite` / `TodoRead`，防复杂任务迷路）
 - [x] **Step 9**：语义化工具 + 子 Agent（`Task` 委派 explore / general / review / research）
 - [ ] **TODO（重要，稍后做）**：工具权限管理  
@@ -218,7 +218,7 @@ Description: 当需要查实时信息、新闻、资料、事实核对……时�
 
 规则（已确认）：
 
-1. `len(history) >= 20` 触发压缩（按 messages 条数）  
+1. `len(history) >= 50` 触发压缩（按 messages 条数）  
 2. 压缩成功后 working history 保留最近 **6** 条（并避免以 assistant / 裸 tool_result 开头）  
 3. 记忆进 **system**；近期原始对话进 **messages**  
 4. 压缩模型只输出约定 JSON（`mid_summary` / `long_term` / `open_todos` / `user_preferences_delta` / `discarded_notes`）  
