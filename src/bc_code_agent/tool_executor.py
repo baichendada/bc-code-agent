@@ -62,6 +62,7 @@ class ToolExecutor:
         todo_write: Callable[[list], str] | None = None,
         todo_read: Callable[[], str] | None = None,
         team_dispatch: Callable[[str, dict], str] | None = None,
+        mcp_dispatch: Callable[[str, dict], str] | None = None,
         log: bool = True,
     ) -> None:
         self.allowed = allowed
@@ -71,6 +72,7 @@ class ToolExecutor:
         self.todo_write = todo_write
         self.todo_read = todo_read
         self.team_dispatch = team_dispatch
+        self.mcp_dispatch = mcp_dispatch
         self.log = log
 
     def _tag(self, name: str) -> str:
@@ -80,10 +82,20 @@ class ToolExecutor:
 
     def run(self, name: str, tool_input: dict) -> str:
         if self.allowed is not None and name not in self.allowed:
-            return f"Tool not allowed: {name}"
+            # 动态 MCP 工具：主 Agent 有 mcp_dispatch 即可，不要求写进静态白名单
+            if not (name.startswith("mcp__") and self.mcp_dispatch is not None):
+                return f"Tool not allowed: {name}"
 
         if self.log:
             print(f"{self._tag(name)}: {brief_tool_input(name, tool_input)}")
+
+        if name.startswith("mcp__"):
+            if self.mcp_dispatch is None:
+                return f"Tool not allowed: {name}"
+            result = self.mcp_dispatch(name, tool_input)
+            if self.log:
+                print(f"{self._tag('result')}: {result[:500]}")
+            return result
 
         file_result = run_file_tool(name, tool_input)
         if file_result is not None:

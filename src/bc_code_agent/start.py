@@ -19,11 +19,13 @@ from subagents import TASK_TOOL_SCHEMA, run_subagent
 from tool_executor import ToolExecutor, brief_tool_input
 from team_store import LEAD_ID, TeamStore
 from team_runtime import TEAM_TOOL_SCHEMAS, AgentTeamManager
+from mcp_hub import McpHub
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = ROOT / ".env"
 SKILLS_DIR = ROOT / "skills"
+MCP_CONFIG = ROOT / "mcp.json"
 
 if not ENV_PATH.is_file():
     raise SystemExit(
@@ -95,6 +97,11 @@ AgentTeam（长期协作）规则：
 7. 队友之间可以互发消息；你负责最终向主人汇报，保持猫娘口吻与喵～后缀。
 8. 队友 status=busy 时不要连续空转 ListTeammates；最多查 1～2 次，或 ReadInbox 看 lead 未读，或发一条催促后向主人说明「还在等」；主人侧也可用 /listTeam、/inbox。
 9. 团队交付完成后先 DisbandTeam 停掉队友，再向主人做最终汇报，避免队友后台继续空转。
+
+MCP 工具规则：
+1. 主 Agent 可用 MCP filesystem 工具（名称形如 mcp__filesystem__list_directory）。
+2. 项目内日常读写仍优先用内置 Read/Write/Grep/Glob；需要 MCP 约定能力（如 directory_tree、search_files）时再用 mcp__*。
+3. MCP 工具暂不开放给 Task 子 Agent / AgentTeam 队友。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -108,6 +115,9 @@ def build_system_prompt() -> str:
     parts.append(todos.prompt_section())
     if team_store.has_active_team():
         parts.append("# Active AgentTeam\n" + team_store.format_members_report())
+    mcp_catalog = mcp_hub.catalog_prompt()
+    if mcp_catalog:
+        parts.append(mcp_catalog)
     return "\n\n".join(parts)
 
 
@@ -248,10 +258,19 @@ team = AgentTeamManager(
 )
 atexit.register(team.shutdown)
 
+mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
+print(mcp_hub.start())
+TOOLS.extend(mcp_hub.tool_schemas)
+atexit.register(mcp_hub.stop)
+
 
 def lead_team_dispatch(name: str, tool_input: dict) -> str:
     result = team.run_team_tool(name, tool_input, caller_id=LEAD_ID)
     return result if result is not None else f"Unknown team tool: {name}"
+
+
+def lead_mcp_dispatch(name: str, tool_input: dict) -> str:
+    return mcp_hub.call_tool(name, tool_input)
 
 
 main_executor = ToolExecutor(
@@ -260,6 +279,7 @@ main_executor = ToolExecutor(
     todo_write=todos.write,
     todo_read=todos.read,
     team_dispatch=lead_team_dispatch,
+    mcp_dispatch=lead_mcp_dispatch,
 )
 
 

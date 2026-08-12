@@ -14,6 +14,7 @@
 - [x] **Step 8**：Todo 任务清单（`TodoWrite` / `TodoRead`，防复杂任务迷路）
 - [x] **Step 9**：语义化工具 + 子 Agent（`Task` 委派 explore / general / review / research）
 - [x] **Step 10**：AgentTeam（`Spawn` 自定义队友 + mailbox 互发消息 + 单 session 单队）
+- [x] **Step 11**：MCP Host（`mcp.json` + filesystem server，仅主 Agent）
 - [ ] **TODO（重要，稍后做）**：工具权限管理  
   - Shell 等危险工具需要 `allow` / `ask` / `deny`，否则模型可直接改文件、跑命令  
   - 当前为学习阶段故意先不做；**不要上生产 / 别对重要目录裸跑**
@@ -457,10 +458,24 @@ Spawn(
 4. **斜杠命令**：`/listTeam` 看队伍；`/inbox <队友> <内容>` 以 lead 身份发消息（不经 LLM）  
 5. **体验约定**：busy 时少轮询；交付后 `DisbandTeam`；`ReadInbox who=self` 可读自己的箱；已 `SendMessage` 给 lead 则不再 auto-report  
 
+## Step 11：MCP Host（filesystem，仅主 Agent）
+
+把 MCP server 的工具接到主 Agent，命名：`mcp__{server}__{tool}`。
+
+| 项 | 说明 |
+|---|---|
+| 配置 | 项目根 `mcp.json`（Cursor 风格 `mcpServers`） |
+| 默认 server | `npx -y @modelcontextprotocol/server-filesystem ${ROOT}`，沙箱=项目根 |
+| 接入 | `mcp_hub.py`：后台 asyncio 线程保活 stdio Client；同步 `call_tool` |
+| 范围 | **仅主 Agent**；Task / AgentTeam 暂不开放 |
+| 与内置工具 | 日常读写仍用 `Read`/`Write`/`Grep`/`Glob`；需要 MCP 约定能力（如 `directory_tree`）再用 `mcp__*` |
+
+启动时终端可见：`[MCP] connected filesystem (... tools)`。依赖：`pip install mcp`，本机需有 `npx`。
+
 ## 快速开始
 
 ```bash
-pip3 install -r requirements.txt   # 含 anthropic / python-dotenv / ddgs
+pip3 install -r requirements.txt   # 含 anthropic / python-dotenv / ddgs / mcp
 ```
 
 在项目根创建 `.env`（已 gitignore，勿提交密钥）：
