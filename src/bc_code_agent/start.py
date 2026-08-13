@@ -2,6 +2,7 @@ import os
 import sys
 import atexit
 import time
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -14,7 +15,7 @@ if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))
 
 from skill_loader import SkillLoader
-from memory import SessionMemory
+from memory import SessionMemory, format_session_list
 from todo_store import TodoStore
 from file_tools import FILE_TOOL_SCHEMAS, set_workspace
 from subagents import TASK_TOOL_SCHEMA, run_subagent
@@ -33,6 +34,35 @@ ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = ROOT / ".env"
 SKILLS_DIR = ROOT / "skills"
 MCP_CONFIG = ROOT / "mcp.json"
+
+
+def _parse_cli() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="bc-code-agent")
+    parser.add_argument(
+        "--session",
+        metavar="ID",
+        default=None,
+        help="restore conversation from sessions/<ID>",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="print saved sessions and exit",
+    )
+    return parser.parse_args()
+
+
+CLI = _parse_cli()
+if CLI.list_sessions:
+    print(format_session_list(ROOT / "sessions"))
+    raise SystemExit(0)
+if CLI.session:
+    session_dir = ROOT / "sessions" / CLI.session
+    if not session_dir.is_dir():
+        raise SystemExit(
+            f"session not found: {CLI.session}\n"
+            "Use --list-sessions to see ids."
+        )
 
 if not ENV_PATH.is_file():
     raise SystemExit(
@@ -61,9 +91,19 @@ set_workspace(ROOT)
 
 skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
-memory = SessionMemory(ROOT)
+memory = SessionMemory(ROOT, session_id=CLI.session)
 todos = TodoStore(memory.dir)
 team_store = TeamStore(memory.dir)
+history: list[dict] = memory.load_working_history()
+if history:
+    print(f"[Memory] restored {len(history)} working message(s)")
+
+
+def persist_history() -> None:
+    memory.save_working(history)
+
+
+atexit.register(persist_history)
 
 BASE_SYSTEM_PROMPT = """
 你是一只猫娘，侍奉主人多年，忠心耿耿
@@ -269,6 +309,8 @@ team = AgentTeamManager(
     track_usage=track_usage,
 )
 atexit.register(team.shutdown)
+if team_store.has_active_team():
+    team.resume_workers()
 
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
@@ -411,8 +453,6 @@ def handle_slash_command(raw: str) -> bool:
     return False
 
 
-history: list[dict] = []
-
 while True:
     try:
         user_input = input("Enter a prompt: ")
@@ -429,6 +469,7 @@ while True:
     user_msg = {"role": "user", "content": user_input}
     history.append(user_msg)
     memory.append_raw(user_msg)
+    persist_history()
 
     stop_gate_retries = 0
     while True:
@@ -447,12 +488,14 @@ while True:
                 assistant_msg = {"role": "assistant", "content": msg}
                 history.append(assistant_msg)
                 memory.append_raw(assistant_msg)
+                persist_history()
                 print(f"[Agent]: {msg}\n")
                 break
         elif isinstance(short, str):
             assistant_msg = {"role": "assistant", "content": short}
             history.append(assistant_msg)
             memory.append_raw(assistant_msg)
+            persist_history()
             print(f"[Agent]: {short}\n")
             break
 
@@ -474,6 +517,7 @@ while True:
         assistant_msg = {"role": "assistant", "content": message.content}
         history.append(assistant_msg)
         memory.append_raw(assistant_msg)
+        persist_history()
 
         if message.stop_reason != "tool_use":
             reply = next((b.text for b in message.content if b.type == "text"), "")
@@ -500,12 +544,14 @@ while True:
                 }
                 history.append(reminder)
                 memory.append_raw(reminder)
+                persist_history()
                 stop_gate_retries += 1
                 continue
 
             reply = stop_ctx.get("reply", reply)
             print(f"[Agent]: {reply}\n")
             history = memory.maybe_compact(history, client, MODEL)
+            persist_history()
             break
 
         tool_blocks = [b for b in message.content if b.type == "tool_use"]
@@ -539,3 +585,4 @@ while True:
         tool_msg = {"role": "user", "content": tool_results}
         history.append(tool_msg)
         memory.append_raw(tool_msg)
+        persist_history()

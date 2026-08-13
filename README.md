@@ -16,13 +16,14 @@
 - [x] **Step 10**：AgentTeam（`Spawn` 自定义队友 + mailbox 互发消息 + 单 session 单队）
 - [x] **Step 11**：MCP Host（`mcp.json` + filesystem server，仅主 Agent）
 - [x] **Step 12**：Hooks（`hooks.json` + command/builtin；Event→Matcher→Handler→Decision）
-- [ ] **Step 13**：Goal Loop（可验证终点 + 独立核验才停）
-- [ ] **Step 14**：Permission 管道（工具前 allow/ask/deny 一等公民）
-- [ ] **Step 15**：Background Shell（慢命令后台 + 完成通知）
-- [ ] **Step 16**：Task 图（落盘任务 + `blockedBy`）
-- [ ] **Step 17**：Team v2（原子领取 + 任务绑定 worktree）
-- [ ] **Step 18**：Cron（到点触发）
-- [ ] **Step 19**：Workflow Runtime（固定编排脚本 + journal 可 resume）
+- [x] **Step 13**：Session 续聊（`--list-sessions` + `--session <id>`）
+- [ ] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
+- [ ] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
+- [ ] **Step 16**：Background Shell（慢命令后台 + 完成通知）
+- [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
+- [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
+- [ ] **Step 19**：Cron（到点触发）
+- [ ] **Step 20**：Workflow Runtime（固定编排脚本 + journal 可 resume）
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
 
@@ -581,9 +582,43 @@ Decision：`allow`（可 `updatedInput`）/ `deny`（拦工具）/ `ask`（TTY �
 6. **改策略**：编辑 `hooks.json` / `hooks/tool_policy.py`，无需改主循环  
 7. **sandbox/** 为演示产物，已 gitignore
 
+## Step 13：Session 续聊
+
+对话工作记忆写入 `sessions/<id>/working.json`；`--session` 启动时读回 `history`（无快照则从 `transcript.jsonl` 降级重建）。不做进程内 `/resume`。
+
+```bash
+python3 src/bc_code_agent/start.py --list-sessions
+python3 src/bc_code_agent/start.py --session 20260813-141850
+```
+
+同时恢复同目录下的 Todo / 长期记忆；若队伍仍为 active，重新拉起队友线程（进程退出不再 Disband，只停 worker）。
+
+### 示例
+
+先新开一轮，让模型记住暗号后 Ctrl+C：
+
+```text
+请记住一个暗号：蓝猫饼干。不要用工具，直接用一句话确认你记住了，喵～
+```
+
+再带 `--session` 接上（实测 session `20260813-141850`）：
+
+```text
+[Memory] session=20260813-141850 dir=.../sessions/20260813-141850
+[Memory] restored 2 working message(s)
+Enter a prompt: 暗号是什么
+[Agent]: 主人，暗号是「蓝猫饼干」呀，喵～
+```
+
+要点：
+
+1. **列表**：`--list-sessions` 不连模型、不连 MCP  
+2. **快照**：运行中写入 `working.json`；恢复时读回 `history`  
+3. **对照**：不带 `--session` 再开是新目录，不应再记得暗号  
+
 ## 后续规划（对照 learn-claude-code s01–s17）
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks。  
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊。  
 差的是后半程：长任务、无人值守闸门、编排与收口。排序原则：
 
 1. 先改循环的停法，再加外围调度  
@@ -591,28 +626,28 @@ Decision：`allow`（可 `updatedInput`）/ `deny`（拦工具）/ `ask`（TTY �
 3. Team 抢任务 / worktree 依赖任务图，不要提前做  
 
 ```text
-现在 (Chat loop + Hooks + Team mailbox)
-    → 13 Goal Loop
-         → 14 Permission（给无人值守加硬闸）
-         → 15 Background Shell（给长命令让路）
-    → 16 Task 图 → 17 Team 抢任务/worktree
-    → 18 Cron（发现工作）
-    → 19 Workflow（固定路径用代码编）
+现在 (Chat loop + Hooks + Session 续聊)
+    → 14 Goal Loop
+         → 15 Permission（给无人值守加硬闸）
+         → 16 Background Shell（给长命令让路）
+    → 17 Task 图 → 18 Team 抢任务/worktree
+    → 19 Cron（发现工作）
+    → 20 Workflow（固定路径用代码编）
 ```
 
 | Step | 做什么 | 为什么排这里 | MVP |
 |---|---|---|---|
-| 13 Goal Loop | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use` | `/goal` + `GOAL.md` + 轮次预算 + review/测试当 verifier |
-| 14 Permission | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认 |
-| 15 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
-| 16 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
-| 17 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
-| 18 Cron | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 inbox/`/goal` 丢一条 |
-| 19 Workflow | 固定编排用脚本 + journal | 路径固定时别再让模型每步想 | 一种：测→改→再测，断点可续 |
+| 14 Goal Loop | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `GOAL.md` + 轮次预算 + review/测试当 verifier |
+| 15 Permission | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认 |
+| 16 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
+| 17 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
+| 18 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
+| 19 Cron | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 inbox/`/goal` 丢一条 |
+| 20 Workflow | 固定编排用脚本 + journal | 路径固定时别再让模型每步想 | 一种：测→改→再测，断点可续 |
 
 不要抢跑：先做 Cron/Workflow（没有 Goal 仍是跑一轮就停）；先做 worktree（没有任务图就没有领取对象）；把 Todo 当成 Goal（Todo 是 checklist，Goal 是宿主外循环 + 核验器）。
 
-### Step 13 MVP 草案
+### Step 14 MVP 草案
 
 ```text
 /goal <一句话 + 可验证 done>
@@ -650,6 +685,8 @@ REASONING_EFFORT=high
 
 ```bash
 python3 src/bc_code_agent/start.py
+python3 src/bc_code_agent/start.py --list-sessions
+python3 src/bc_code_agent/start.py --session <session_id>
 ```
 
 说明：

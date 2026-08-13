@@ -76,6 +76,7 @@ class SessionMemory:
         self.dir.mkdir(parents=True, exist_ok=True)
 
         self.transcript_path = self.dir / "transcript.jsonl"
+        self.working_path = self.dir / "working.json"
         self.mid_path = self.dir / "mid.jsonl"
         self.long_path = self.dir / "long_term.json"
         self.pref_path = self.dir / "preferences.json"
@@ -110,6 +111,50 @@ class SessionMemory:
         }
         with self.transcript_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def save_working(self, history: list[dict[str, Any]]) -> None:
+        """当前发给 API 的 history 快照，供 --session 恢复。"""
+        payload = {
+            "session_id": self.session_id,
+            "messages": [_for_api_message(m) for m in history],
+        }
+        self.working_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_working_history(self) -> list[dict[str, Any]]:
+        """优先 working.json；没有则从 transcript.jsonl 重建。"""
+        history: list[dict[str, Any]] = []
+        if self.working_path.is_file():
+            try:
+                raw = json.loads(self.working_path.read_text(encoding="utf-8"))
+                messages = raw.get("messages") if isinstance(raw, dict) else None
+                if isinstance(messages, list):
+                    history = [
+                        _for_api_message(m) for m in messages if isinstance(m, dict)
+                    ]
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                history = []
+        if not history:
+            history = self._history_from_transcript()
+        return _repair_incomplete_tool_turn(history)
+
+    def _history_from_transcript(self) -> list[dict[str, Any]]:
+        if not self.transcript_path.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        for line in self.transcript_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = rec.get("message") if isinstance(rec, dict) else None
+            if isinstance(msg, dict) and msg.get("role"):
+                rows.append(_for_api_message(msg))
+        return rows
 
     def record_usage(
         self,
@@ -181,6 +226,7 @@ class SessionMemory:
 
         self._apply_compaction(result)
         trimmed = _trim_working_history(history, KEEP_RECENT)
+        self.save_working(trimmed)
         print(
             f"[Memory] compact ok: mid+1 long updated; "
             f"working history {len(history)} -> {len(trimmed)}"
@@ -344,3 +390,165 @@ def _trim_working_history(
                 return [msg]
         return history[-1:]
     return trimmed
+
+
+_SKIP_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+
+
+def _for_api_message(message: dict[str, Any]) -> dict[str, Any]:
+    """去掉 thinking 等不可回放块，只保留 API 可接受的 content。"""
+    role = message.get("role")
+    content = _jsonable_content(message.get("content"))
+    if isinstance(content, list):
+        cleaned: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in _SKIP_BLOCK_TYPES:
+                continue
+            if btype == "text":
+                cleaned.append({"type": "text", "text": str(block.get("text") or "")})
+            elif btype == "tool_use":
+                cleaned.append(
+                    {
+                        "type": "tool_use",
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": block.get("input") or {},
+                    }
+                )
+            elif btype == "tool_result":
+                cleaned.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.get("tool_use_id"),
+                        "content": block.get("content") or "",
+                    }
+                )
+            else:
+                cleaned.append(block)
+        content = cleaned if cleaned else content
+    return {"role": role, "content": content}
+
+
+def _tool_use_ids(message: dict[str, Any]) -> list[str]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    ids: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            uid = str(block.get("id") or "")
+            if uid:
+                ids.append(uid)
+    return ids
+
+
+def _repair_incomplete_tool_turn(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """最后一条 assistant 带 tool_use 但没有 tool_result 时补一条，避免 API 拒收。"""
+    if not history:
+        return history
+    last = history[-1]
+    if last.get("role") != "assistant":
+        return history
+    ids = _tool_use_ids(last)
+    if not ids:
+        return history
+    results = [
+        {
+            "type": "tool_result",
+            "tool_use_id": uid,
+            "content": "tool interrupted (session restored before tool_result)",
+        }
+        for uid in ids
+    ]
+    return list(history) + [{"role": "user", "content": results}]
+
+
+def _preview_text(message: dict[str, Any] | None, limit: int = 48) -> str:
+    if not message:
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content.strip().replace("\n", " ")
+        return text[:limit]
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "").strip().replace("\n", " ")
+                if text:
+                    return text[:limit]
+            if isinstance(block, str) and block.strip():
+                return block.strip().replace("\n", " ")[:limit]
+        if content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
+            return "(tool_result)"
+    return ""
+
+
+def list_sessions(sessions_root: Path) -> list[dict[str, Any]]:
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        working = path / "working.json"
+        transcript = path / "transcript.jsonl"
+        if not working.is_file() and not transcript.is_file():
+            continue
+        mtime = path.stat().st_mtime
+        n_msgs = 0
+        preview = ""
+        if working.is_file():
+            try:
+                raw = json.loads(working.read_text(encoding="utf-8"))
+                messages = raw.get("messages") if isinstance(raw, dict) else []
+                if isinstance(messages, list):
+                    n_msgs = len(messages)
+                    for msg in reversed(messages):
+                        if isinstance(msg, dict) and msg.get("role") == "user":
+                            preview = _preview_text(msg)
+                            if preview:
+                                break
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        if not preview and transcript.is_file():
+            try:
+                lines = [
+                    ln for ln in transcript.read_text(encoding="utf-8").splitlines() if ln.strip()
+                ]
+                if not n_msgs:
+                    n_msgs = len(lines)
+                if lines:
+                    rec = json.loads(lines[-1])
+                    preview = _preview_text(rec.get("message") if isinstance(rec, dict) else None)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        rows.append(
+            {
+                "id": path.name,
+                "mtime": mtime,
+                "n_msgs": n_msgs,
+                "preview": preview,
+            }
+        )
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def format_session_list(sessions_root: Path) -> str:
+    rows = list_sessions(sessions_root)
+    if not rows:
+        return "No sessions under sessions/. Run the agent once to create one."
+    lines = ["session_id                  msgs  updated              preview", "-" * 72]
+    for row in rows:
+        ts = datetime.fromtimestamp(row["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+        preview = row["preview"] or "-"
+        lines.append(
+            f"{row['id']:<26} {row['n_msgs']:>4}  {ts}  {preview}"
+        )
+    lines.append("")
+    lines.append("Restore: python3 src/bc_code_agent/start.py --session <session_id>")
+    return "\n".join(lines)

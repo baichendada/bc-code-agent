@@ -427,10 +427,21 @@ class AgentTeamManager:
             self._workers.clear()
 
     def shutdown(self) -> None:
-        if self.store.has_active_team():
-            self._stop_all_workers()
-            self.store.mark_disbanded()
-            self.store.clear_after_disband()
+        """进程退出只停线程，不解散队伍（便于 --session 再拉起）。"""
+        self._stop_all_workers()
+
+    def resume_workers(self) -> None:
+        """按磁盘上的 active team 重新拉起队友线程。"""
+        if not self.store.has_active_team():
+            return
+        n = 0
+        for config in self.store.list_members():
+            if config.status == "busy":
+                self.store.set_member_status(config.id, "idle")
+                config.status = "idle"
+            self._start_worker(config)
+            n += 1
+        print(f"[Team] resumed {n} worker(s)")
 
     def _worker_loop(self, mate_id: str, stop: threading.Event) -> None:
         print(f"[Team] worker start: {mate_id}")
