@@ -16,8 +16,14 @@
 - [x] **Step 10**：AgentTeam（`Spawn` 自定义队友 + mailbox 互发消息 + 单 session 单队）
 - [x] **Step 11**：MCP Host（`mcp.json` + filesystem server，仅主 Agent）
 - [x] **Step 12**：Hooks（`hooks.json` + command/builtin；Event→Matcher→Handler→Decision）
-- [ ] **TODO（重要，稍后做）**：更细的交互式权限 UI / http·prompt·agent handler  
-  - Step 12 已对齐 Claude Code 的 hooks.json + command；生产级权限 UI 仍可增强  
+- [ ] **Step 13**：Goal Loop（可验证终点 + 独立核验才停）
+- [ ] **Step 14**：Permission 管道（工具前 allow/ask/deny 一等公民）
+- [ ] **Step 15**：Background Shell（慢命令后台 + 完成通知）
+- [ ] **Step 16**：Task 图（落盘任务 + `blockedBy`）
+- [ ] **Step 17**：Team v2（原子领取 + 任务绑定 worktree）
+- [ ] **Step 18**：Cron（到点触发）
+- [ ] **Step 19**：Workflow Runtime（固定编排脚本 + journal 可 resume）
+- [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
 
 ## Step 2 现象：能循环，但不记得上文
@@ -574,6 +580,54 @@ Decision：`allow`（可 `updatedInput`）/ `deny`（拦工具）/ `ask`（TTY �
 5. **审计**：成功执行的 Write/Shell 写入 `sessions/<id>/tool_audit.jsonl`  
 6. **改策略**：编辑 `hooks.json` / `hooks/tool_policy.py`，无需改主循环  
 7. **sandbox/** 为演示产物，已 gitignore
+
+## 后续规划（对照 learn-claude-code s01–s17）
+
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks。  
+差的是后半程：长任务、无人值守闸门、编排与收口。排序原则：
+
+1. 先改循环的停法，再加外围调度  
+2. Goal 会长时间自己调工具，闸门要够用（Step 12 Hook 可撑 MVP）  
+3. Team 抢任务 / worktree 依赖任务图，不要提前做  
+
+```text
+现在 (Chat loop + Hooks + Team mailbox)
+    → 13 Goal Loop
+         → 14 Permission（给无人值守加硬闸）
+         → 15 Background Shell（给长命令让路）
+    → 16 Task 图 → 17 Team 抢任务/worktree
+    → 18 Cron（发现工作）
+    → 19 Workflow（固定路径用代码编）
+```
+
+| Step | 做什么 | 为什么排这里 | MVP |
+|---|---|---|---|
+| 13 Goal Loop | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use` | `/goal` + `GOAL.md` + 轮次预算 + review/测试当 verifier |
+| 14 Permission | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认 |
+| 15 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
+| 16 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
+| 17 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
+| 18 Cron | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 inbox/`/goal` 丢一条 |
+| 19 Workflow | 固定编排用脚本 + journal | 路径固定时别再让模型每步想 | 一种：测→改→再测，断点可续 |
+
+不要抢跑：先做 Cron/Workflow（没有 Goal 仍是跑一轮就停）；先做 worktree（没有任务图就没有领取对象）；把 Todo 当成 Goal（Todo 是 checklist，Goal 是宿主外循环 + 核验器）。
+
+### Step 13 MVP 草案
+
+```text
+/goal <一句话 + 可验证 done>
+    → 写入 sessions/<id>/GOAL.md
+    → while status == running 且未超预算:
+         现有 LLM + 工具循环（Todo/Task/Hooks 照旧）
+         模型想停 → 不直接结束
+         → Verifier（复用 review 子 Agent，或跑一条检查命令）
+         → PASS: completed
+         → FAIL: 缺口塞回 history，continue
+    → /goal status | pause | resume | clear
+```
+
+预算示例：最多 8 轮 LLM；连续 2 次核验失败则 `blocked` 交还主人。  
+刻意不做：独立 verifier 模型、多数投票、strategist。
 
 ## 快速开始
 
