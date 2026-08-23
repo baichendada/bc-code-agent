@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -114,17 +115,18 @@ def validate_cron(expr: str) -> str | None:
 # ---------- 匹配 ----------
 
 
-def _cron_field_matches(field: str, value: int) -> bool:
+def _cron_field_matches(field: str, value: int, lo: int) -> bool:
     if field == "*":
         return True
     if field.startswith("*/"):
         step = int(field[2:])
-        return value % step == 0
+        # 起点 = 字段最小值：day/month 从 1 开始（1,3,5...），minute/hour 从 0 开始
+        return (value - lo) % step == 0
     if "-" in field:
         a, b = (int(p) for p in field.split("-"))
         return a <= value <= b
     if "," in field:
-        return any(_cron_field_matches(item, value) for item in field.split(","))
+        return any(_cron_field_matches(item, value, lo) for item in field.split(","))
     if field.isdigit():
         return int(field) == value
     return False
@@ -137,7 +139,10 @@ def cron_matches(expr: str, moment) -> bool:
     # cron 语义: weekday 0=周日（与 datetime.weekday() 0=周一 不一致，需转换）
     cron_weekday = (moment.weekday() + 1) % 7
     values = [moment.minute, moment.hour, moment.day, moment.month, cron_weekday]
-    return all(_cron_field_matches(f, v) for f, v in zip(fields, values))
+    return all(
+        _cron_field_matches(f, v, lo)
+        for f, v, (_, lo, _) in zip(fields, values, FIELD_RANGES)
+    )
 
 
 # ---------- 存储 ----------
@@ -152,11 +157,16 @@ class CronStore:
         self.path = Path(path) if path else None
         self.jobs: dict[str, CronJob] = {}
         self._counter = 0
+        self._lock = threading.Lock()  # 调度线程 / 队列线程 / 主线程三方并发访问
 
     # ---------- 持久化 ----------
 
     def load(self) -> None:
         """启动恢复；文件不存在 → 空；损坏 → 报错（fail-closed，不静默丢任务）。"""
+        with self._lock:
+            self._load_locked()
+
+    def _load_locked(self) -> None:
         if self.path is None or not self.path.is_file():
             return
         try:
@@ -173,6 +183,10 @@ class CronStore:
         self._counter = len(self.jobs)
 
     def save(self) -> None:
+        with self._lock:
+            self._save_locked()
+
+    def _save_locked(self) -> None:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,84 +203,91 @@ class CronStore:
     # ---------- 任务管理 ----------
 
     def add(self, cron: str, prompt: str, recurring: bool = True) -> CronJob:
-        err = validate_cron(cron)
-        if err:
-            raise CronError(err)
-        prompt = prompt.strip()
-        if not prompt:
-            raise CronError("prompt 不能为空")
-        self._counter += 1
-        job = CronJob(
-            id=f"c_{self._counter:04d}",
-            cron=cron,
-            prompt=prompt,
-            recurring=recurring,
-        )
-        self.jobs[job.id] = job
-        self.save()
-        return job
+        with self._lock:
+            err = validate_cron(cron)
+            if err:
+                raise CronError(err)
+            prompt = prompt.strip()
+            if not prompt:
+                raise CronError("prompt 不能为空")
+            self._counter += 1
+            job = CronJob(
+                id=f"c_{self._counter:04d}",
+                cron=cron,
+                prompt=prompt,
+                recurring=recurring,
+            )
+            self.jobs[job.id] = job
+            self._save_locked()
+            return job
 
     def remove(self, job_id: str) -> str:
-        job = self.jobs.pop(job_id, None)
-        if job is None:
-            return f"任务不存在: {job_id}"
-        self.save()
-        return f"已删除 {job_id}: {job.cron} {job.prompt[:40]}"
+        with self._lock:
+            job = self.jobs.pop(job_id, None)
+            if job is None:
+                return f"任务不存在: {job_id}"
+            self._save_locked()
+            return f"已删除 {job_id}: {job.cron} {job.prompt[:40]}"
 
     def set_enabled(self, job_id: str, enabled: bool) -> str:
-        job = self.jobs.get(job_id)
-        if job is None:
-            return f"任务不存在: {job_id}"
-        job.enabled = enabled
-        self.save()
-        return f"已{'恢复' if enabled else '暂停'} {job_id}: {job.prompt[:40]}"
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return f"任务不存在: {job_id}"
+            job.enabled = enabled
+            self._save_locked()
+            return f"已{'恢复' if enabled else '暂停'} {job_id}: {job.prompt[:40]}"
 
     # ---------- 到期与投递 ----------
 
     def poll_due(self, moment) -> list[CronJob]:
         """到期检查（调度线程每秒调用）。命中 → pending + last_fired + 落盘。"""
-        minute_marker = moment.strftime(MINUTE_MARKER)
-        due: list[CronJob] = []
-        for job in self.jobs.values():
-            if not job.enabled or job.pending_delivery:
-                continue
-            if job.last_fired == minute_marker:
-                continue
-            if cron_matches(job.cron, moment):
-                job.pending_delivery = True
-                job.last_fired = minute_marker
-                due.append(job)
-        if due:
-            self.save()
-        return due
+        with self._lock:
+            minute_marker = moment.strftime(MINUTE_MARKER)
+            due: list[CronJob] = []
+            for job in self.jobs.values():
+                if not job.enabled or job.pending_delivery:
+                    continue
+                if job.last_fired == minute_marker:
+                    continue
+                if cron_matches(job.cron, moment):
+                    job.pending_delivery = True
+                    job.last_fired = minute_marker
+                    due.append(job)
+            if due:
+                self._save_locked()
+            return due
 
     def take_pending(self) -> list[CronJob]:
         """队列处理器抢到锁后消费：取出待投递任务并清除 pending。"""
-        pending = [j for j in self.jobs.values() if j.pending_delivery]
-        if not pending:
-            return []
-        for job in pending:
-            job.pending_delivery = False
-        self.save()
-        return pending
+        with self._lock:
+            pending = [j for j in self.jobs.values() if j.pending_delivery]
+            if not pending:
+                return []
+            for job in pending:
+                job.pending_delivery = False
+            self._save_locked()
+            return pending
 
     def ack(self, jobs: list[CronJob]) -> None:
         """一轮 scheduled turn 结束后确认：一次性任务删除，重复任务保留。"""
-        for job in jobs:
-            if not job.recurring:
-                self.jobs.pop(job.id, None)
-        self.save()
+        with self._lock:
+            for job in jobs:
+                if not job.recurring:
+                    self.jobs.pop(job.id, None)
+            self._save_locked()
 
     def list_text(self) -> str:
-        if not self.jobs:
-            return "没有定时任务"
-        lines = ["id        cron                 状态    prompt"]
-        for job in self.jobs.values():
-            state = "暂停" if not job.enabled else ("待投递" if job.pending_delivery else "运行")
-            lines.append(
-                f"{job.id:<9} {job.cron:<20} {state:<5} {job.prompt[:40]}"
-            )
-        return "\n".join(lines)
+        with self._lock:
+            if not self.jobs:
+                return "没有定时任务"
+            lines = ["id        cron                 状态    prompt"]
+            for job in self.jobs.values():
+                state = "暂停" if not job.enabled else ("待投递" if job.pending_delivery else "运行")
+                lines.append(
+                    f"{job.id:<9} {job.cron:<20} {state:<5} {job.prompt[:40]}"
+                )
+            return "\n".join(lines)
 
 
 # ---------- 工具 schema（模型侧也可注册/取消/查看） ----------

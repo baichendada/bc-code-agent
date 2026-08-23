@@ -436,13 +436,13 @@ def permission_gate(name: str, tool_input: dict) -> tuple[str | None, bool]:
     if verdict.decision == "deny":
         return f"[Permission: 拒绝] {verdict.reason}（匹配规则: {verdict.rule}）", False
     if verdict.decision == "ask":
-        if is_scheduled_turn():
-            # 定时轮不与主终端抢交互输入：ask 一律拒绝（可以配 YOLO 放行）
-            print(f"[Permission] 定时任务运行中，跳过交互确认 → 拒绝: {verdict.reason}")
-            return f"[Permission: 拒绝] 定时任务中未确认：{verdict.reason}", False
+        # 顺序：YOLO 优先（放行），否则定时轮 fail-closed（不抢终端）
         if permissions.effective_mode() == "yolo":
             print(f"[Permission] YOLO 模式自动放行: {verdict.reason}")
             return None, True
+        if is_scheduled_turn():
+            print(f"[Permission] 定时任务运行中，跳过交互确认 → 拒绝: {verdict.reason}")
+            return f"[Permission: 拒绝] 定时任务中未确认：{verdict.reason}", False
         if confirm_permission(verdict, name, tool_input):
             return None, True
         return f"[Permission: 拒绝] 用户未确认：{verdict.reason}", False
@@ -500,12 +500,12 @@ except CronError as exc:
     raise SystemExit(str(exc)) from exc
 
 agent_lock = threading.Lock()          # 用户轮 / 定时轮互斥（scheduled turn 不抢终端）
-_SCHEDULED_TURN = threading.local()    # “当前是否定时轮”标记（权限 ask 不弹窗）
+_SCHEDULED_TURN = threading.Event()    # “当前是否定时轮”全局标志（Event 线程安全）
 _CRON_STOP = threading.Event()
 
 
 def is_scheduled_turn() -> bool:
-    return getattr(_SCHEDULED_TURN, "running", False)
+    return _SCHEDULED_TURN.is_set()
 
 
 def cron_scheduler_loop() -> None:
@@ -530,6 +530,9 @@ def cron_queue_loop() -> None:
             print(f"[Cron] 到点投递 {len(jobs)} 个定时任务")
             run_turn({"role": "user", "content": text}, scheduled=True)
             cron_store.ack(jobs)
+        except Exception as exc:  # noqa: BLE001
+            # 兜底：任何异常都不能杀死队列线程（Kron 停摆 = 定时任务集体失效）
+            print(f"[Cron] 投递循环出错: {type(exc).__name__}: {exc}")
         finally:
             agent_lock.release()
 
@@ -890,7 +893,7 @@ def run_turn(user_msg: dict, scheduled: bool = False) -> None:
     用户轮与定时轮共用；scheduled=True 时权限 ask 不弹窗（不抢终端）。"""
     global history
     if scheduled:
-        _SCHEDULED_TURN.running = True
+        _SCHEDULED_TURN.set()
     try:
         history.append(user_msg)
         memory.append_raw(user_msg)
@@ -1055,7 +1058,7 @@ def run_turn(user_msg: dict, scheduled: bool = False) -> None:
             persist_history()
     finally:
         if scheduled:
-            _SCHEDULED_TURN.running = False
+            _SCHEDULED_TURN.clear()
 
 
 _start_cron_threads()
