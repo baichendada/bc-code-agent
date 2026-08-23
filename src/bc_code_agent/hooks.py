@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -231,10 +233,21 @@ def _parse_command_result(
 
     text = stdout.strip()
     if not text:
+        if exit_code != 0:
+            print(
+                f"[hook warning] {canonical} exited with code {exit_code} and no "
+                f"stdout -> treated as allow (fail-open)"
+            )
         return None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
+        if exit_code != 0:
+            print(
+                f"[hook warning] {canonical} exited with code {exit_code} and "
+                f"unparsable stdout -> treated as allow (fail-open): "
+                f"{text[:120]!r}"
+            )
         return None
     if not isinstance(data, dict):
         return None
@@ -271,6 +284,28 @@ def _parse_command_result(
     return None
 
 
+def _command_available(name: str) -> str | None:
+    """命令可用性检查；WindowsApps 的应用执行别名（stub）会骗过 which，
+    但 cmd 执行时返回 9009，必须视为不可用。"""
+    path = shutil.which(name)
+    if path is None:
+        return None
+    if os.name == "nt" and "windowsapps" in path.lower():
+        return None
+    return path
+
+
+def _normalize_command(command: str) -> str:
+    """跨平台命令兼容：Windows 下可能只有 python 没有 python3。"""
+    head = command.split(maxsplit=1)[0] if command.strip() else ""
+    if head in ("python3", "python"):
+        if _command_available(head) is None:
+            alt = "python" if head == "python3" else "python3"
+            if _command_available(alt) is not None:
+                return command.replace(head, alt, 1)
+    return command
+
+
 def make_command_handler(
     *,
     event: str,
@@ -279,6 +314,8 @@ def make_command_handler(
     project_root: Path,
     name: str,
 ) -> Callable[[dict[str, Any]], Any]:
+    command = _normalize_command(command)
+
     def handler(ctx: dict[str, Any]) -> Any:
         payload = _build_command_payload(event, ctx)
         try:
@@ -287,12 +324,19 @@ def make_command_handler(
                 input=json.dumps(payload, ensure_ascii=False),
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
                 shell=True,
                 cwd=str(project_root),
             )
         except subprocess.TimeoutExpired:
             print(f"[hook error] {name} timed out after {timeout}s")
+            return None
+        except OSError as exc:
+            print(
+                f"[hook error] {name} failed to start: {type(exc).__name__}: {exc} "
+                f"-> 该 Hook 将静默放行（fail-open），请检查命令/解释器"
+            )
             return None
         if proc.stderr:
             # keep teaching logs visible

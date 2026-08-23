@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import fnmatch
 from pathlib import Path
 from typing import Any
+
+from security import match_sensitive_path, match_shell_command
+
+# 慢命令防护：Shell 默认超时（秒）
+SHELL_TIMEOUT = 120
+
+# Read 单文件上限：防止把超大文件整读进内存
+MAX_READ_BYTES = 2_000_000
+
+# 搜索要跳过的目录（Grep 的 Python fallback / Glob 通用排除；sandbox 是演示产物，不排除）
+EXCLUDE_DIR_NAMES = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "sessions",
+}
 
 WORKSPACE: Path | None = None
 
@@ -155,7 +174,15 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
     if not file_path.is_file():
         return f"Error: not a file: {_display_path(file_path)}"
 
-    text = file_path.read_text(encoding="utf-8", errors="replace")
+    total_bytes = file_path.stat().st_size
+    truncated = total_bytes > MAX_READ_BYTES
+    if truncated:
+        # 按字节截断（中文等宽字符 3 字节/字，read(N) 字符数会偏差）
+        with file_path.open("rb") as f:
+            data = f.read(MAX_READ_BYTES)
+        text = data.decode("utf-8", errors="replace")
+    else:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
     start = max((offset or 1) - 1, 0)
@@ -169,11 +196,29 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
         f"{str(i).rjust(width)}|{line}" for i, line in enumerate(selected, start=start + 1)
     ]
     header = f"{_display_path(file_path)} ({len(lines)} lines)"
-    return header + "\n" + "\n".join(numbered)
+    body = "\n".join(numbered)
+    if truncated:
+        body += (
+            f"\n\n[... 文件过大，仅显示前 {MAX_READ_BYTES} 字节"
+            f"（原始 {total_bytes} 字节）]"
+        )
+    return header + "\n" + body
 
 
 def write_file(path: str, contents: str) -> str:
     file_path = resolve_path(path)
+    # 按 workspace 相对路径做敏感检查：避免工作区路径本身含 secrets/.env 等词被误杀
+    # （与 hooks/tool_policy.py 对原始相对路径的口径保持一致）
+    try:
+        rel = str(file_path.relative_to(_workspace_root()))
+    except ValueError:
+        rel = str(file_path)
+    hit = match_sensitive_path(rel)
+    if hit:
+        return (
+            f"Security: 敏感路径写入已拦截：'{_display_path(file_path)}'"
+            f"（匹配模式：{hit}）"
+        )
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(contents, encoding="utf-8")
     line_count = 0 if contents == "" else contents.count("\n") + (0 if contents.endswith("\n") else 1)
@@ -192,6 +237,11 @@ def _grep_with_rg(
     except ValueError:
         pass
     cmd = ["rg", "--line-number", "--no-heading", "--color=never", pattern, search_arg]
+    # rg 默认只跳隐藏目录 + 尊重 .gitignore；非 git 仓库或未 ignore 目录要显式排除。
+    # 用 !**/{name}/** 排除任意层级的嵌套目录（仅 !{name}/** 只排根层级）
+    for name in sorted(EXCLUDE_DIR_NAMES):
+        cmd.insert(-1, "--glob")
+        cmd.insert(-1, f"!**/{name}/**")
     if glob:
         cmd.insert(-1, "--glob")
         cmd.insert(-1, glob)
@@ -201,12 +251,16 @@ def _grep_with_rg(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=_workspace_root(),
             timeout=30,
         )
     except FileNotFoundError:
         return None
 
+    if proc.stdout is None:
+        return f"Grep failed: no output captured (exit {proc.returncode})"
     output = proc.stdout.strip()
     if proc.returncode not in (0, 1):
         err = (proc.stderr or proc.stdout or "").strip()
@@ -238,7 +292,12 @@ def _grep_with_python(
     if search_path.is_file():
         files = [search_path]
     else:
-        files = [p for p in search_path.rglob("*") if p.is_file()]
+        # os.walk 剪枝：跳过 .git / node_modules / sessions 等噪声目录
+        files = []
+        for root, dirs, names in os.walk(search_path):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIR_NAMES]
+            for name in names:
+                files.append(Path(root) / name)
 
     for file_path in sorted(files):
         rel = _display_path(file_path)
@@ -273,10 +332,8 @@ def grep_search(
     search_path = resolve_path(path or ".")
     head_limit = max(1, min(int(head_limit or 200), 2000))
 
-    if search_path.is_dir() and not search_path.exists():
-        return f"Error: directory not found: {_display_path(search_path)}"
-    if search_path.is_file() and not search_path.exists():
-        return f"Error: file not found: {_display_path(search_path)}"
+    if not search_path.exists():
+        return f"Error: path not found: {_display_path(search_path)}"
 
     rg_result = _grep_with_rg(pattern, search_path, glob, head_limit)
     if rg_result is not None:
@@ -284,21 +341,43 @@ def grep_search(
     return _grep_with_python(pattern, search_path, glob, head_limit)
 
 
+def _glob_safe(base: Path, pattern: str) -> list[Path]:
+    """Path.glob 的 case_sensitive 参数是 Python 3.12+；旧版本回退。"""
+    try:
+        return list(base.glob(pattern, case_sensitive=False))
+    except TypeError:
+        return list(base.glob(pattern))
+
+
 def glob_files(pattern: str, target_directory: str | None = None) -> str:
     pattern = (pattern or "").strip()
     if not pattern:
         return "Error: empty pattern"
+
+    # pathlib 的 glob 中 "**" 结尾只匹配目录自身（如 sandbox/** 仅返回 sandbox 目录），
+    # 补 "/*" 让「目录下所有文件」的直觉写法生效
+    if pattern.endswith("/**"):
+        pattern += "/*"
+    elif pattern == "**":
+        pattern = "**/*"
 
     base = resolve_path(target_directory or ".")
     if not base.is_dir():
         return f"Error: not a directory: {_display_path(base)}"
 
     if pattern.startswith("**/"):
-        matches = sorted(base.glob(pattern, case_sensitive=False))
+        matches = sorted(_glob_safe(base, pattern))
     elif "**" in pattern:
-        matches = sorted(base.glob(pattern, case_sensitive=False))
+        matches = sorted(_glob_safe(base, pattern))
     else:
         matches = sorted(base.rglob(pattern))
+
+    # 统一排除 .git / node_modules / sessions 等噪声目录
+    matches = [
+        p
+        for p in matches
+        if not any(part in EXCLUDE_DIR_NAMES for part in p.parts)
+    ]
 
     if not matches:
         return f"No files matched: {pattern!r}"
@@ -314,18 +393,33 @@ def glob_files(pattern: str, target_directory: str | None = None) -> str:
     return "\n".join(rel_paths)
 
 
-def shell_command(command: str) -> str:
+def shell_command(command: str, timeout: float | None = None) -> str:
     command = (command or "").strip()
     if not command:
         return "Error: empty command"
 
-    result = subprocess.run(
-        command,
-        shell=True,
-        capture_output=True,
-        text=True,
-        cwd=_workspace_root(),
-    )
+    # 内置兜底（所有调用方，包括不经过主 Agent Hook 链的子 Agent/队友）
+    hit = match_shell_command(command)
+    if hit:
+        pattern, description = hit
+        return f"Security: 危险命令已拦截：{description}（匹配模式：{pattern}）"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            cwd=_workspace_root(),
+            timeout=timeout if timeout is not None else SHELL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        limit = timeout if timeout is not None else SHELL_TIMEOUT
+        return f"Error: Shell command timed out after {int(limit)}s: {command[:120]}"
+    except OSError as exc:
+        return f"Error: Shell failed to start: {type(exc).__name__}: {exc}"
+
     output = result.stdout or result.stderr or ""
     if not output.strip():
         return "(no output)" if result.returncode == 0 else f"Exit {result.returncode} (no output)"

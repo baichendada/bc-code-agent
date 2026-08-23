@@ -2,15 +2,21 @@
 
 MVP：仅主 Agent 使用；默认 stdio 连接 filesystem（限制在项目根）。
 工具名：mcp__{server}__{tool}
+
+环境变量 MCP_ENABLED=0 可整体跳过（npx/依赖不可用时快速启动）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
+
+# 连接启动上限：npx 首次拉包可能慢，但不该让主循环死等
+CONNECT_TIMEOUT_SEC = 20
 
 
 def _content_to_text(result: Any) -> str:
@@ -39,6 +45,24 @@ def _content_to_text(result: Any) -> str:
 
 def anthropic_name(server: str, tool: str) -> str:
     return f"mcp__{server}__{tool}"
+
+
+def _tool_schema(server_name: str, tool: Any) -> dict[str, Any]:
+    """MCP SDK 不同版本 Tool 属性名不同（input_schema / inputSchema），统一兼容。"""
+    name = getattr(tool, "name", "")
+    input_schema = getattr(tool, "input_schema", None) or getattr(
+        tool, "inputSchema", None
+    )
+    if hasattr(input_schema, "model_dump"):
+        input_schema = input_schema.model_dump(by_alias=True, exclude_none=True)
+    elif not isinstance(input_schema, dict):
+        input_schema = {"type": "object", "properties": {}}
+    desc = getattr(tool, "description", None) or f"MCP tool {name} from {server_name}"
+    return {
+        "name": anthropic_name(server_name, name),
+        "description": f"[MCP:{server_name}] {desc}",
+        "input_schema": input_schema,
+    }
 
 
 def parse_anthropic_name(name: str) -> tuple[str, str] | None:
@@ -72,6 +96,8 @@ class McpHub:
 
     def start(self) -> str:
         """启动连接；返回状态摘要。失败不抛，返回错误说明。"""
+        if os.getenv("MCP_ENABLED", "1") == "0":
+            return "MCP: disabled (MCP_ENABLED=0)"
         if self._thread and self._thread.is_alive():
             return self.status_text()
 
@@ -97,7 +123,7 @@ class McpHub:
 
         self._thread = threading.Thread(target=runner, name="mcp-hub", daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=120)
+        self._ready.wait(timeout=CONNECT_TIMEOUT_SEC)
         return self.status_text()
 
     def stop(self) -> None:
@@ -128,9 +154,9 @@ class McpHub:
         if not self._tool_schemas:
             return ""
         lines = [
-            "# MCP Tools (filesystem)",
+            "# MCP Tools",
             "以下工具来自 MCP server，仅主 Agent 可用。命名：`mcp__{server}__{tool}`。",
-            "项目内读写可继续用内置 Read/Write/Grep/Glob；MCP filesystem 适合按 MCP 约定探索同一工作区。",
+            "项目内读写可继续用内置 Read/Write/Grep/Glob；MCP 工具适合按 MCP 约定探索同一工作区。",
             "",
         ]
         for schema in self._tool_schemas:
@@ -213,23 +239,11 @@ class McpHub:
 
             listed = await session.list_tools()
             for tool in listed.tools:
-                anth = anthropic_name(server_name, tool.name)
-                input_schema = tool.input_schema
-                if hasattr(input_schema, "model_dump"):
-                    input_schema = input_schema.model_dump(
-                        by_alias=True, exclude_none=True
-                    )
-                elif not isinstance(input_schema, dict):
-                    input_schema = {"type": "object", "properties": {}}
-                desc = tool.description or f"MCP tool {tool.name} from {server_name}"
-                self._tool_schemas.append(
-                    {
-                        "name": anth,
-                        "description": f"[MCP:{server_name}] {desc}",
-                        "input_schema": input_schema,
-                    }
+                self._tool_schemas.append(_tool_schema(server_name, tool))
+                self._tool_index[anthropic_name(server_name, tool.name)] = (
+                    server_name,
+                    tool.name,
                 )
-                self._tool_index[anth] = (server_name, tool.name)
             print(
                 f"[MCP] connected `{server_name}` "
                 f"({len(listed.tools)} tools) via {command}"

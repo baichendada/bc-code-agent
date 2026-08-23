@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import threading
-import time
 from typing import Any, Callable
 
 from file_tools import FILE_TOOL_SCHEMAS
 from subagents import LOAD_SKILL_SCHEMA, WEB_SEARCH_SCHEMA
 from team_store import (
     LEAD_ID,
-    TEAMMATE_MESSAGE_TOOLS,
+    RESERVED_IDS,
     TEAMMATE_OPTIONAL_TOOLS,
     TeamMessage,
     TeamStore,
@@ -263,8 +262,14 @@ class AgentTeamManager:
         if err:
             return f"Spawn failed: {err}"
 
-        self.store.ensure_active_team(goal=goal)
         mate_id = slugify(name)
+        if mate_id in RESERVED_IDS:
+            return (
+                f"Spawn failed: {mate_id!r} is a reserved id "
+                f"(lead/主人/猫娘 等，用于寻址主 Agent)，请换一个名字。"
+            )
+
+        self.store.ensure_active_team(goal=goal)
         # avoid collision
         base = mate_id
         n = 2
@@ -455,7 +460,7 @@ class AgentTeamManager:
                 break
             self.store.set_member_status(mate_id, "busy")
             try:
-                self._run_teammate_turn(config, unread)
+                self._run_teammate_turn(config, unread, stop)
                 self.store.set_member_status(mate_id, "idle")
             except Exception as exc:  # noqa: BLE001
                 print(f"[Team] worker error {mate_id}: {type(exc).__name__}: {exc}")
@@ -478,8 +483,10 @@ class AgentTeamManager:
         return schemas
 
     def _run_teammate_turn(
-        self, config: TeammateConfig, unread: list[TeamMessage]
+        self, config: TeammateConfig, unread: list[TeamMessage], stop: threading.Event
     ) -> None:
+        """跑一轮队友 turn；stop 置位时在每次 LLM 调用/工具执行前中止。
+        注意：无法取消进行中的单次 LLM 请求，只能保证之后不再调用工具/发消息。"""
         print(f"[Team] wake {config.id}: {len(unread)} message(s)")
         allowed = set(config.tools)
         # strip lead-only just in case
@@ -511,6 +518,10 @@ class AgentTeamManager:
         max_turns = config.max_turns or DEFAULT_MAX_TURNS
 
         for _ in range(max_turns):
+            if stop.is_set():
+                # Disband 竞态防护：解散后不再发起新 LLM 调用 / 执行工具 / 发消息
+                print(f"[Team] worker {config.id} turn aborted by stop")
+                return
             message = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -528,6 +539,9 @@ class AgentTeamManager:
             messages.append({"role": "assistant", "content": message.content})
 
             if message.stop_reason != "tool_use":
+                if stop.is_set():
+                    # 解散后不再向已解散队伍写消息（含 auto-report）
+                    return
                 text = next(
                     (b.text for b in message.content if b.type == "text"), ""
                 ).strip()
@@ -553,6 +567,8 @@ class AgentTeamManager:
             for block in message.content:
                 if block.type != "tool_use":
                     continue
+                if stop.is_set():
+                    break
                 result = executor.run(block.name, dict(block.input))
                 tool_results.append(
                     {

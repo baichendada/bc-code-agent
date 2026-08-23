@@ -616,7 +616,7 @@ Enter a prompt: 暗号是什么
 2. **快照**：运行中写入 `working.json`；恢复时读回 `history`  
 3. **对照**：不带 `--session` 再开是新目录，不应再记得暗号  
 
-## 后续规划（对照 learn-claude-code s01–s17）
+## 后续规划
 
 前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊。  
 差的是后半程：长任务、无人值守闸门、编排与收口。排序原则：
@@ -693,3 +693,5 @@ python3 src/bc_code_agent/start.py --session <session_id>
 
 - `.env` 会覆盖 shell / `~/.zshrc` 里同名的 `ANTHROPIC_*`
 - 智谱 Anthropic 接口模型名用 `glm-5.2`（不要用 Claude Code 别名 `glm-5.2[1M]`）
+- 没有 node/npx 环境时设 `MCP_ENABLED=0` 跳过 MCP（启动不再等连接超时）
+- 运行测试：`python3 -m unittest discover -s tests -p "test_*.py"`（覆盖安全策略、工具沙箱、记忆裁剪、hook 链路、Team/Todo 存储）

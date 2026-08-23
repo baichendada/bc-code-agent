@@ -1,0 +1,2 @@
+# 统一行尾：Git 内按 LF 存储（Windows 编辑器写 CRLF 也不会造成全文件 diff 噪音）
+* text=auto eol=lf

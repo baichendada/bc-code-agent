@@ -25,16 +25,25 @@ class TodoStore:
     def _load(self) -> None:
         if not self.path.is_file():
             return
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        self.items = [
-            TodoItem(
-                id=str(x.get("id") or ""),
-                content=str(x.get("content") or ""),
-                status=str(x.get("status") or "pending"),
-            )
-            for x in raw
-            if x.get("id") and x.get("content")
-        ]
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            self.items = [
+                TodoItem(
+                    id=str(x.get("id") or ""),
+                    content=str(x.get("content") or ""),
+                    status=str(x.get("status") or "pending"),
+                )
+                for x in raw
+                if x.get("id") and x.get("content")
+            ]
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            # 与 memory/team_store 同策略：损坏文件改名保留，不阻塞启动
+            try:
+                self.path.rename(self.path.with_suffix(".json.bak"))
+            except OSError:
+                pass
+            print(f"[Todo] 无法解析 {self.path}，已跳过（备份为 .json.bak）")
+            self.items = []
 
     def _save(self) -> None:
         self.path.write_text(

@@ -81,6 +81,14 @@ class ToolExecutor:
         return f"[{name}]"
 
     def run(self, name: str, tool_input: dict) -> str:
+        """统一分发；任何工具内部异常都不允许炸掉调用方（主循环/子 Agent/队友）。"""
+        try:
+            return self._run_inner(name, tool_input)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{self._tag(name)} error: {type(exc).__name__}: {exc}")
+            return f"[Tool error] {name} failed: {type(exc).__name__}: {exc}"
+
+    def _run_inner(self, name: str, tool_input: dict) -> str:
         if self.allowed is not None and name not in self.allowed:
             # 动态 MCP 工具：主 Agent 有 mcp_dispatch 即可，不要求写进静态白名单
             if not (name.startswith("mcp__") and self.mcp_dispatch is not None):

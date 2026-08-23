@@ -12,6 +12,11 @@ from typing import Any
 
 LEAD_ID = "lead"
 
+# resolve_recipient 的保留别名：Spawn 不得占用，否则队友永远无法被寻址
+RESERVED_IDS = frozenset(
+    {LEAD_ID, "main", "self", "me", "主人", "猫娘", "自己", "我"}
+)
+
 # 队友可选工具（硬禁 Shell / Todo / Spawn / Task / Disband）
 TEAMMATE_OPTIONAL_TOOLS = frozenset(
     {"Read", "Write", "Grep", "Glob", "WebSearch", "LoadSkill"}
@@ -285,7 +290,8 @@ class TeamStore:
 
     def _next_msg_id(self) -> str:
         self._msg_seq += 1
-        return f"msg-{self._msg_seq}-{datetime.now().strftime('%H%M%S')}"
+        # 微秒时间戳：跨进程重启也几乎不冲突
+        return f"msg-{self._msg_seq}-{datetime.now().strftime('%H%M%S%f')}"
 
     def append_message(
         self,

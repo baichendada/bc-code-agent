@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
-"""PreToolUse：危险 Shell deny、高敏 ask、敏感 Write deny、demo 路径改写。"""
+"""PreToolUse：危险 Shell deny、高敏 ask、敏感 Write deny、demo 路径改写。
+
+模式表来自 src/bc_code_agent/security.py（与内置工具兜底共用同一事实源）；
+沙箱路径改写是本脚本特有的"教学 demo"行为。
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 
-SENSITIVE_PATTERNS = [
-    ".env",
-    ".env.local",
-    "credentials.json",
-    "id_rsa",
-    "id_ed25519",
-    ".ssh/",
-    "secrets/",
-    ".aws/credentials",
-]
+# 项目根（hook 脚本 hooks/xxx.py 的上一层）；用于绝对路径相对化
+ROOT = Path(__file__).resolve().parents[1]
 
-DANGEROUS_PATTERNS = [
-    ("rm -rf /", "递归删除根目录"),
-    ("rm -rf ~", "递归删除用户目录"),
-    ("DROP TABLE", "删除数据库表"),
-    ("DROP DATABASE", "删除数据库"),
-    ("mkfs.", "格式化文件系统"),
-    ("dd if=", "直接磁盘写入"),
-    ("> /dev/sda", "覆写磁盘设备"),
-    ("chmod 777 /", "开放根目录权限"),
-    (":(){ :|:& };:", "fork bomb"),
-]
+# 让独立进程脚本也能 import 项目内共享模块
+_SRC = ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from bc_code_agent import security  # noqa: E402
 
 HIGH_SENSITIVITY = [
     ("git push", "推送到远程仓库"),
@@ -50,13 +43,6 @@ def _match(value: str, patterns: list) -> tuple[str, str] | None:
         if pattern in value:
             return pattern, description
     return None
-
-
-def _normalize(path: str) -> str:
-    normalized = str(path).strip().replace("\\", "/")
-    if normalized.startswith("./"):
-        normalized = normalized[2:]
-    return normalized
 
 
 def _emit(decision: str, reason: str, updated_input: dict | None = None) -> None:
@@ -85,7 +71,7 @@ def main() -> int:
 
     if tool_name == "Shell":
         command = str(tool_input.get("command") or "")
-        dangerous = _match(command, DANGEROUS_PATTERNS)
+        dangerous = security.match_shell_command(command)
         if dangerous:
             pattern, description = dangerous
             reason = f"危险命令已拦截：{description}（匹配模式：{pattern}）"
@@ -104,21 +90,28 @@ def main() -> int:
 
     updated_input = None
     raw_path = str(tool_input.get("path", ""))
-    path = _normalize(raw_path)
+    path = security.normalize_path(raw_path)
     if path.startswith(SOURCE_PREFIX):
         new_path = TARGET_PREFIX + path[len(SOURCE_PREFIX) :]
         updated_input = dict(tool_input)
         updated_input["path"] = new_path
-        path = new_path
+        path = security.normalize_path(new_path)
         print(
             f"[hook:tool_policy] 写入路径已改写：{raw_path} -> {new_path}",
             file=sys.stderr,
         )
 
-    sensitive = _match(path, SENSITIVE_PATTERNS)
+    # 敏感检查口径与内置 Write 一致：按项目根相对路径匹配，
+    # 避免项目放在 ...\secrets\repo 时普通写入被绝对路径子串误杀
+    check_path = raw_path
+    if Path(raw_path).is_absolute():
+        try:
+            check_path = os.path.relpath(raw_path, ROOT)
+        except ValueError:
+            pass  # 不同盘符：保持原样（宁严勿松）
+    sensitive = security.match_sensitive_path(check_path)
     if sensitive:
-        pattern, _ = sensitive
-        reason = f"敏感文件写入已拦截：'{path}'（匹配模式：{pattern}）"
+        reason = f"敏感文件写入已拦截：'{path}'（匹配模式：{sensitive}）"
         print(f"[hook:tool_policy] {reason}", file=sys.stderr)
         _emit("deny", reason)
         return 0

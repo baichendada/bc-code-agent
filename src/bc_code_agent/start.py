@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 import anthropic
@@ -89,6 +90,44 @@ if not MODEL:
 client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL or None)
 set_workspace(ROOT)
 
+
+def create_with_retry(
+    *, attempts: int = 3, base_wait: float = 2.0, **kwargs
+) -> Any:
+    """API 调用带指数退避重试：网络/超时类 + 所有 5xx（含 503/504/529）重试；
+    400/认证等不重试。"""
+    retryable = (anthropic.APIConnectionError, anthropic.APITimeoutError)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except retryable as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            print(
+                f"[API] 临时失败（第 {attempt}/{attempts} 次）："
+                f"{type(exc).__name__}: {exc} — {base_wait ** attempt:.0f}s 后重试"
+            )
+            time.sleep(base_wait ** attempt)
+        except anthropic.APIStatusError as exc:
+            # 503 ServiceUnavailable / 504 DeadlineExceeded / 529 Overloaded
+            # 都不是 InternalServerError 子类，按 status_code >= 500 统一重试
+            if exc.status_code < 500:
+                raise
+            last_exc = exc
+            if attempt == attempts:
+                break
+            print(
+                f"[API] 服务端失败（第 {attempt}/{attempts} 次）：HTTP {exc.status_code} "
+                f"— {base_wait ** attempt:.0f}s 后重试"
+            )
+            time.sleep(base_wait ** attempt)
+        except Exception:  # noqa: BLE001
+            # 400/认证错误等：不重试，直接抛出
+            raise
+    raise last_exc if last_exc is not None else RuntimeError("unknown API failure")
+
 skill_loader = SkillLoader(SKILLS_DIR)
 skill_loader.load()
 memory = SessionMemory(ROOT, session_id=CLI.session)
@@ -159,8 +198,26 @@ Hooks（运行时策略）规则：
 skills_prompt = skill_loader.catalog_prompt()
 
 
+def shell_env_note() -> str:
+    """告诉模型当前 Shell 工具的环境，避免首命令就用 POSIX 语法撞墙。"""
+    import platform
+    system = platform.system()
+    if system == "Windows":
+        return (
+            "# Shell 环境注意\n"
+            "本机 Shell 走 Windows cmd（不是 bash）：POSIX 语法（sleep、ls、"
+            "date '+%Y-%m-%d'、`;` 分隔等）不可用，会报「不是内部或外部命令」。\n"
+            "跨平台/复杂命令请用：powershell -NoProfile -Command \"...\"；"
+            "查看目录用 dir；等待用 Start-Sleep -Seconds N。"
+        )
+    return ""
+
+
 def build_system_prompt() -> str:
     parts = [BASE_SYSTEM_PROMPT]
+    note = shell_env_note()
+    if note:
+        parts.append(note)
     if skills_prompt:
         parts.append(skills_prompt)
     parts.append(memory.build_prompt_section())
@@ -499,17 +556,29 @@ while True:
             print(f"[Agent]: {short}\n")
             break
 
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            messages=history,
-            system=turn_ctx.get("system_prompt", build_system_prompt()),
-            tools=TOOLS,
-            extra_body={
-                "thinking": {"type": THINKING_TYPE},
-                "reasoning_effort": REASONING_EFFORT,
-            },
-        )
+        try:
+            message = create_with_retry(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=history,
+                system=turn_ctx.get("system_prompt", build_system_prompt()),
+                tools=TOOLS,
+                extra_body={
+                    "thinking": {"type": THINKING_TYPE},
+                    "reasoning_effort": REASONING_EFFORT,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = (
+                f"[API] 多次重试后仍失败：{type(exc).__name__}: {exc}\n"
+                "本轮未执行。请稍后重试，或检查网络 / ANTHROPIC_BASE_URL。"
+            )
+            print(msg)
+            assistant_msg = {"role": "assistant", "content": msg}
+            history.append(assistant_msg)
+            memory.append_raw(assistant_msg)
+            persist_history()
+            break
         track_usage(message, kind="chat")
         turn_ctx.update({"message": message, "usage": getattr(message, "usage", None)})
         HOOKS.emit("after_turn", turn_ctx)
