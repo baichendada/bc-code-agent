@@ -41,6 +41,7 @@ from goal import (
     PromptGoalEvaluator,
 )
 from permissions import PermissionsConfig
+from bg_jobs import BACKGROUND, format_task_list, install_cleanup
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -226,6 +227,11 @@ Goal（目标循环）规则：
 3. 运行验证命令（如测试、typecheck）后，必须清晰汇报命令与结果（如 exit code、关键输出），让独立评估器能据此判断条件是否满足。
 4. 只有评估器判定通过才算达成；不要自行宣称“完成了”。
 5. 评估未通过时会把你缺失的证据再次发给你，继续工作即可。
+
+Background（后台任务）规则：
+1. 只有“独立、不阻塞后续步骤”的慢命令才用 Shell(background=true)（如安装依赖、完整测试套件）；后续步骤依赖其结果的命令必须同步执行。
+2. 后台调用立即返回任务 id（如 bg_0001）；完成结果会在后续轮次以 [Background] 通知注入对话，收到后据此继续。
+3. 用 /bg 查看任务状态；/bg kill <id> 可停止。子 Agent 不支持后台（会降级为同步执行）。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -470,6 +476,8 @@ permissions = PermissionsConfig.load(project_root=ROOT)
 if permissions.effective_mode() == "yolo":
     print("[Permission] YOLO=1：ask 项自动放行，deny 仍生效")
 
+install_cleanup()
+
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
 TOOLS.extend(mcp_hub.tool_schemas)
@@ -616,6 +624,66 @@ def handle_permissions_command(raw: str) -> bool:
     return True
 
 
+def inject_background(history: list[dict]) -> int:
+    """每轮 LLM 调用前收集完成的后台任务，作为通知注入对话（不新建 tool_result）。"""
+    notifications = BACKGROUND.collect()
+    if not notifications:
+        return 0
+    text = "\n\n".join(notifications)
+    for item in notifications:
+        print(item)
+    block = {"type": "text", "text": text}
+    if history and history[-1].get("role") == "user":
+        content = history[-1].get("content")
+        if isinstance(content, list):
+            history[-1]["content"] = list(content) + [block]
+        else:
+            history[-1]["content"] = [
+                {"type": "text", "text": str(content)},
+                block,
+            ]
+        persist_history()
+    else:
+        msg = {"role": "user", "content": [block]}
+        history.append(msg)
+        memory.append_raw(msg)
+        persist_history()
+    return len(notifications)
+
+
+def wait_background(manager, timeout: float = 600.0) -> bool:
+    """Goal defer 后等待后台任务完成；超时返回 False。"""
+    waited = 0.0
+    while manager.running() > 0:
+        if waited >= timeout:
+            return False
+        time.sleep(1.0)
+        waited += 1.0
+    return True
+
+
+def handle_background_command(raw: str) -> bool:
+    """/bg：任务列表；/bg kill <id> 停止；/bg clear 清已完成记录。"""
+    line = raw.strip()
+    if not line.lower().startswith("/bg"):
+        return False
+    arg = line[3:].strip()
+    if not arg:
+        print(format_task_list() + "\n")
+        return True
+    cmd, _, rest = arg.partition(" ")
+    cmd_lower = cmd.lower()
+    if cmd_lower == "kill" and rest.strip():
+        print(f"{BACKGROUND.kill(rest.strip())}\n")
+        return True
+    if cmd_lower == "clear":
+        count = BACKGROUND.clear_finished()
+        print(f"[Background] 已清除 {count} 个已完成任务记录\n")
+        return True
+    print("用法: /bg | /bg kill <bg_id> | /bg clear\n")
+    return True
+
+
 def handle_goal_command(raw: str) -> str | None:
     """处理 /goal；返回 'goal-run' 表示条件已注入、应进入内层循环。"""
     line = raw.strip()
@@ -705,6 +773,8 @@ while True:
     else:
         if handle_permissions_command(user_input):
             continue
+        if handle_background_command(user_input):
+            continue
         if handle_slash_command(user_input):
             continue
         user_msg = {"role": "user", "content": user_input}
@@ -716,6 +786,7 @@ while True:
     stop_gate_retries = 0
     while True:
         history = memory.maybe_compact(history, client, MODEL)
+        inject_background(history)
 
         turn_ctx: dict = {
             "history": history,
@@ -777,7 +848,17 @@ while True:
             reply = next((b.text for b in message.content if b.type == "text"), "")
 
             if goal_controller.active is not None:
-                decision = goal_controller.evaluate_after_turn(history)
+                decision = goal_controller.evaluate_after_turn(
+                    history, background_running=BACKGROUND.running() > 0
+                )
+                if decision.action == "defer":
+                    # 后台任务仍在跑：等它完成（collect 后有通知，下一轮注入）
+                    print("[Background] goal 等待后台任务完成...")
+                    if wait_background(BACKGROUND):
+                        continue
+                    print("[Background] 等待超时（600s），任务仍在运行；本轮交还主人")
+                    print(f"[Agent]: {reply}\n")
+                    break
                 if decision.action == "block":
                     print(f"[Goal] 未达成: {decision.reason}")
                     reminder = {

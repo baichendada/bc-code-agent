@@ -513,6 +513,7 @@ class AgentTeamManager:
             web_search=self.web_search,
             team_dispatch=team_dispatch,
             permission_checker=self.permission_checker,
+            background_allowed=False,
         )
         tools = self._tools_for_member(config)
         messages: list[dict[str, Any]] = [

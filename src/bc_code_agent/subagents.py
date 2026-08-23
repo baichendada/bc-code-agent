@@ -185,6 +185,7 @@ def run_subagent(
         load_skill=load_skill,
         web_search=web_search,
         permission_checker=permission_checker,
+        background_allowed=False,
     )
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt.strip()}]

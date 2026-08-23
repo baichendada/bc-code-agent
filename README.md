@@ -19,7 +19,7 @@
 - [x] **Step 13**：Session 续聊（`--list-sessions` + `--session <id>`）
 - [x] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
 - [x] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
-- [ ] **Step 16**：Background Shell（慢命令后台 + 完成通知）
+- [x] **Step 16**：Background Shell（慢命令后台 + 完成通知）
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
 - [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
 - [ ] **Step 19**：Cron（到点触发）
@@ -782,18 +782,73 @@ Traceback ... permissions.PermissionError: permissions.json 无法解析（Expec
 6. **防双确认**：权限层 ask 已确认时（含 YOLO 放行），`tool_policy` 的高敏 ask 自动跳过
 7. **拒绝后不绕行**：模型收到 `[Permission: 拒绝]` 会换合规路径（如改用未被禁的工具），而不是硬顶规则
 
+## Step 16：Background Shell（后台任务）
+
+慢命令（pytest / pip 安装）不该堵住整轮：`Shell(background=true)` 显式后台执行，立即返回任务 id，完成结果在**后续轮次**注入对话。
+
+| 项 | 说明 |
+|---|---|
+| 触发 | `Shell(background=true)`（显式参数，不猜“install/test”等关键词）；系统提示词要求“仅独立、不阻塞后续步骤的命令用后台” |
+| 生命周期 | 登记 `bg_0001` 递增 → daemon 线程执行（独立进程组）→ 立即返回占位结果 → 完成进队列（collect 消费即清空） |
+| 通知 | 不重建 tool_use_id：完成消息是独立事件（`[Background] bg_0001 完成 (exit 0)` + 命令 + 输出摘要 2000 字符） |
+| 注入时机 | 每轮 LLM 调用前 `inject_background()`：合并到最后一条 user 消息或新开一条（**完成不唤醒**，普通对话等你下次输入时才带上） |
+| Goal 联动 | 模型想停 + 后台在跑 → `defer`（评估器先不评）→ 主循环轮询等待（上限 600s）→ 完成注入 → 继续跑 → 再停才评估 |
+| 子 Agent / 队友 | 不支持：`background=true` 自动**降级同步** + 返回提示（无 collect 通道） |
+| 控制 | `/bg`（列表）/ `/bg kill <id>`（进程组）/ `/bg clear`（清已完成；待注入的通知不删） |
+| 进程清理 | 进程组生命周期：POSIX `start_new_session`+`killpg`；Windows `CREATE_NEW_PROCESS_GROUP`+`taskkill /T`；`atexit` 全清 |
+| 持久化 | **不做**：任务生命周期 = 进程生命周期；`--session` 恢复后需重新发起 |
+
+实现：`src/bc_code_agent/bg_jobs.py`（BackgroundManager / 跨平台进程组）+ `file_tools.py`（background_shell）+ `start.py`（注入与 /bg）。
+
+### 实录（2026-08-24，session=`20260824-013355`）
+
+**场景 1：普通对话 —— 完成不唤醒，下轮注入**
+
+```text
+Enter a prompt: 用 Shell(background=true) 启动一个后台任务：sleep 3 后 echo hello-from-bg ...
+[Shell]: command='powershell ... "Start-Sleep -Seconds 3; Write-Output hello-from-bg"'
+[result]: [Background] 任务 bg_0001 已启动（后台执行中）: powershell ...
+[Agent]: 报告主人～任务 ID bg_0001，约 3 秒后完成，结果会以 [Background] 通知送回来～
+
+Enter a prompt: 看下后台任务的结果
+[Background] bg_0001 完成 (exit 0)
+  命令: powershell ...
+  输出: hello-from-bg
+[Agent]: 后台任务的结果已经送到啦...
+```
+
+**场景 2：Goal + 长任务 —— defer 等待**
+
+```text
+/goal 启动一个约 25 秒的后台任务（sleep 25 后输出 bg-defer-ok），完成后汇报
+[Goal] 激活: ...
+[Shell] → [Background] 任务 bg_0001 已启动...
+[Background] goal 等待后台任务完成...      ← defer：评估器先不评，主循环等待
+[Background] bg_0001 完成 (exit 0)         ← 25s 后完成，通知注入
+  输出: bg-defer-ok
+[Token] goal_eval: in=620 out=44
+[Goal] 达成: 后台任务 bg_0001 启动，25 秒后完成并输出 bg-defer-ok，助手已汇报结果
+```
+
+要点：
+
+1. **显式参数**：模型自己决定何时后台；system 提示“依赖结果的步骤必须同步执行”
+2. **不唤醒**：普通对话任务完成不打断、不自动续跑；结果在最接近的下一轮注入（不丢失）
+3. **Goal 内必须等**：goal 语义是“跑完才回”，defer 让后台完成成为续跑触发点（600s 上限防挂死）
+4. **降级兜底**：子 Agent / 队友传 background 会降级同步并提示，不会“启动后没人收结果”
+5. **进程组清理**：kill 命令/进程退出时杀整棵树（Windows taskkill /T），不留孤儿进程
+
 ## 后续规划
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / **permission 管道（Step 15）**。  
-差的是后半程：并行与编排收口。排序原则：
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / permission 管道 / **background shell（Step 16）**。  
+差的是后半程：任务编排与收口。排序原则：
 
 1. 先改循环的停法，再加外围调度（已完成：Step 14）  
 2. 无人值守闸门已齐（Step 15：权限 + YOLO；配合 Step 12 Hook）  
-3. Team 抢任务 / worktree 依赖任务图，不要提前做  
+3. 长命令已让路（Step 16：后台任务 + Goal defer）  
 
 ```text
-现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop)
-    → 16 Background Shell（给长命令让路）
+现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop + Background)
     → 17 Task 图 → 18 Team 抢任务/worktree
     → 19 Cron（发现工作）
     → 20 Workflow（固定路径用代码编）
@@ -803,7 +858,7 @@ Traceback ... permissions.PermissionError: permissions.json 无法解析（Expec
 |---|---|---|---|
 | 14 Goal Loop ✅ | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `goal.json` + block 上限 + 独立评估器 |
 | 15 Permission ✅ | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认；YOLO=1 |
-| 16 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
+| 16 Background Shell ✅ | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
 | 17 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
 | 18 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
 | 19 Cron | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 inbox/`/goal` 丢一条 |

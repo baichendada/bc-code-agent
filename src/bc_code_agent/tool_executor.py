@@ -64,6 +64,7 @@ class ToolExecutor:
         team_dispatch: Callable[[str, dict], str] | None = None,
         mcp_dispatch: Callable[[str, dict], str] | None = None,
         permission_checker: Callable[[str, dict], str | None] | None = None,
+        background_allowed: bool = True,
         log: bool = True,
     ) -> None:
         self.allowed = allowed
@@ -75,6 +76,7 @@ class ToolExecutor:
         self.team_dispatch = team_dispatch
         self.mcp_dispatch = mcp_dispatch
         self.permission_checker = permission_checker
+        self.background_allowed = background_allowed
         self.log = log
 
     def _tag(self, name: str) -> str:
@@ -85,7 +87,20 @@ class ToolExecutor:
     def run(self, name: str, tool_input: dict) -> str:
         """统一分发；任何工具内部异常都不允许炸掉调用方（主循环/子 Agent/队友）。"""
         try:
-            return self._run_inner(name, tool_input)
+            bg_stripped = False
+            if (
+                name == "Shell"
+                and tool_input.get("background")
+                and not self.background_allowed
+            ):
+                # 子 Agent / 队友没有 collect 注入通道：降级为同步执行（Step 16）
+                tool_input = dict(tool_input)
+                tool_input["background"] = False
+                bg_stripped = True
+            result = self._run_inner(name, tool_input)
+            if bg_stripped and isinstance(result, str):
+                result += "\n[提示] 当前执行者不支持后台任务，已降级为同步执行。"
+            return result
         except Exception as exc:  # noqa: BLE001
             print(f"{self._tag(name)} error: {type(exc).__name__}: {exc}")
             return f"[Tool error] {name} failed: {type(exc).__name__}: {exc}"

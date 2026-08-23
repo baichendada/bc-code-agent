@@ -118,7 +118,10 @@ FILE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "Shell",
         "description": (
             "Run a shell command for tasks not covered by Read/Write/Grep/Glob "
-            "(e.g. date, git, python scripts). Do not use for reading/writing files or searching code."
+            "(e.g. date, git, python scripts). Do not use for reading/writing files or searching code.\n"
+            "background=true runs a slow independent command in the background: returns a task id "
+            "immediately; the result is injected as a [Background] notification in a later turn. "
+            "Only use for commands you do NOT need to block on (e.g. install, full test suite)."
         ),
         "input_schema": {
             "type": "object",
@@ -126,6 +129,10 @@ FILE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "true = background execution (immediate task id, result notification later)",
                 },
             },
             "required": ["command"],
@@ -428,6 +435,26 @@ def shell_command(command: str, timeout: float | None = None) -> str:
     return output.rstrip()
 
 
+def background_shell(command: str) -> str:
+    """后台执行 Shell（Step 16）：登记任务后立即返回占位结果。
+    危险命令兜底与同步路径一致（子 Agent/队友不经 Hook 链也不漏）。"""
+    command = (command or "").strip()
+    if not command:
+        return "Error: empty command"
+    hit = match_shell_command(command)
+    if hit:
+        pattern, description = hit
+        return f"Security: 危险命令已拦截：{description}（匹配模式：{pattern}）"
+
+    from bg_jobs import BACKGROUND
+
+    try:
+        task_id = BACKGROUND.start(command, cwd=_workspace_root())
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return f"[Background] 任务 {task_id} 已启动（后台执行中）: {command[:80]}"
+
+
 def run_file_tool(name: str, tool_input: dict[str, Any]) -> str | None:
     if name == "Read":
         return read_file(
@@ -450,5 +477,7 @@ def run_file_tool(name: str, tool_input: dict[str, Any]) -> str | None:
             target_directory=tool_input.get("target_directory"),
         )
     if name == "Shell":
+        if tool_input.get("background"):
+            return background_shell(tool_input.get("command", ""))
         return shell_command(tool_input.get("command", ""))
     return None
