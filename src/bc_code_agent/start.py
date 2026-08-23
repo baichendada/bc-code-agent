@@ -3,6 +3,7 @@ import sys
 import atexit
 import time
 import argparse
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -39,6 +40,7 @@ from goal import (
     GoalError,
     PromptGoalEvaluator,
 )
+from permissions import PermissionsConfig
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -213,6 +215,11 @@ Hooks（运行时策略）规则：
 2. 若 tool_result 含 [HookDecision: 拒绝/阻止]，不要改路径硬绕过，向主人说明并换安全方案。
 3. Task 子 Agent / 队友暂不走主 Agent 的 Hook 链。
 
+Permission（工具权限）规则：
+1. 工具调用前会经过 permissions.json 声明式权限检查（allow / ask / deny 三档，deny 优先，default=ask）。
+2. 若 tool_result 含 [Permission: 拒绝]，说明该操作被规则或主人拦下：不要改写法绕开，向主人说明并换安全方案。
+3. 触发 ask 时终端会等主人输入 y；非交互环境会默认拒绝（fail-closed）。YOLO=1 时 ask 自动放行。
+4. 拒绝后不要立刻用近似参数重试同一操作（视为绕过尝试）。
 Goal（目标循环）规则：
 1. 主人用 /goal <完成条件> 设定后，本会话会持续工作直到条件满足、判定不可能完成、或连续多次核验失败，不会每轮停下来等主人。
 2. 每轮结束时有一个独立评估器检查对话里的证据；它没有工具，只能看到对话内容，不会替你做验证。
@@ -416,6 +423,10 @@ _goal_restored = goal_controller.restore()
 if _goal_restored:
     print(f"[Goal] {_goal_restored}")
 
+permissions = PermissionsConfig.load(project_root=ROOT)
+if permissions.effective_mode() == "yolo":
+    print("[Permission] YOLO=1：ask 项自动放行，deny 仍生效")
+
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
 TOOLS.extend(mcp_hub.tool_schemas)
@@ -448,10 +459,44 @@ HOOKS = load_hooks_from_config(
 HOOKS.emit("on_session_start", {"session_dir": str(memory.dir)})
 
 
+def confirm_permission(verdict) -> bool:
+    """ask 决策：TTY 输入 y 才继续；非交互 fail-closed。"""
+    print(f"\n[permission] {verdict.reason}")
+    if not sys.stdin.isatty():
+        print("[permission] 当前不是交互式终端，默认拒绝执行。\n")
+        return False
+    try:
+        answer = input(
+            "[permission] 是否继续执行？输入 y 继续，其余取消: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
 def execute_main_tool(block) -> str:
-    """主 Agent 工具入口：统一经过 before/after tool hooks。"""
+    """主 Agent 工具入口：声明式权限 → Hook 链 → 执行。"""
     name = block.name
-    tool_ctx: dict = {"name": name, "input": dict(block.input)}
+    inp = dict(block.input)
+
+    # 声明式权限（Step 15）：deny 直接拒绝；ask 需确认；allow 放行
+    verdict = permissions.check(name, inp)
+    permission_approved = False
+    if verdict.decision == "deny":
+        return f"[Permission: 拒绝] {verdict.reason}（匹配规则: {verdict.rule}）"
+    if verdict.decision == "ask":
+        if permissions.effective_mode() == "yolo":
+            print(f"[Permission] YOLO 模式自动放行: {verdict.reason}")
+        elif confirm_permission(verdict):
+            permission_approved = True
+        else:
+            return f"[Permission: 拒绝] 用户未确认：{verdict.reason}"
+
+    tool_ctx: dict = {"name": name, "input": inp}
+    if permission_approved:
+        # 权限层已确认：Hook 层的同类 ask（如 tool_policy 的高敏命令）不再重复弹窗
+        tool_ctx["permission_approved"] = True
     decision = HOOKS.emit("before_tool_call", tool_ctx, tool_matcher=name)
     if isinstance(decision, HookDecision):
         if decision.is_blocking:
@@ -517,6 +562,35 @@ def run_task_block(block) -> tuple[str, str]:
 
 
 GOAL_RUN = "goal-run"
+
+
+def handle_permissions_command(raw: str) -> bool:
+    """/permissions：查看规则与模式；/permissions test <Tool> [json] 试匹配。"""
+    line = raw.strip()
+    if not line.lower().startswith("/permissions"):
+        return False
+    arg = line[len("/permissions"):].strip()
+    if arg.lower().startswith("test"):
+        rest = arg[4:].strip()
+        if not rest:
+            print("用法: /permissions test <工具名> [参数JSON]\n")
+            return True
+        parts = rest.split(None, 1)
+        tool_name = parts[0]
+        tool_input: dict[str, Any] = {}
+        if len(parts) > 1:
+            try:
+                tool_input = json.loads(parts[1])
+            except json.JSONDecodeError:
+                print(f"参数 JSON 解析失败：{parts[1]!r}\n")
+                return True
+        verdict = permissions.check(tool_name, tool_input)
+        print(f"{tool_name} → {verdict.decision}（规则: {verdict.rule}）\n")
+        return True
+    print(permissions.describe() + "\n")
+    print("用法: /permissions test <工具名> [参数JSON]  （试匹配，如 /permissions test Shell {\"command\":\"git push\"}）")
+    print()
+    return True
 
 
 def handle_goal_command(raw: str) -> str | None:
@@ -606,6 +680,8 @@ while True:
         # /goal <条件>：把条件本身作为本轮用户消息注入，立即开始工作
         user_msg = {"role": "user", "content": user_input[len("/goal"):].strip()}
     else:
+        if handle_permissions_command(user_input):
+            continue
         if handle_slash_command(user_input):
             continue
         user_msg = {"role": "user", "content": user_input}

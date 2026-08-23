@@ -206,6 +206,7 @@ def _build_command_payload(event: str, ctx: dict[str, Any]) -> dict[str, Any]:
         "reply": ctx.get("reply"),
         "todos": ctx.get("todos"),
         "retry": ctx.get("retry"),
+        "permission_approved": ctx.get("permission_approved", False),
         "history_len": len(ctx.get("history") or []),
         "model": ctx.get("model"),
     }

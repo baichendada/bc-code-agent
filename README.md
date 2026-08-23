@@ -18,7 +18,7 @@
 - [x] **Step 12**：Hooks（`hooks.json` + command/builtin；Event→Matcher→Handler→Decision）
 - [x] **Step 13**：Session 续聊（`--list-sessions` + `--session <id>`）
 - [x] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
-- [ ] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
+- [x] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
 - [ ] **Step 16**：Background Shell（慢命令后台 + 完成通知）
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
 - [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
@@ -693,19 +693,80 @@ Enter a prompt: （输入任意内容即继续）
 4. **与 Todo 协同**：goal 期间的复杂任务照样先 TodoWrite 拆步，两个机制互不干扰
 5. **达成后 goal.json 记录 met**，`/goal` 可回看历史结果；`/goal clear` 对已达成/未激活的 goal 报「当前没有激活的 goal」
 
+## Step 15：Permission 管道（声明式权限）
+
+工具执行与 Hook 之前的**一等公民**闸门：`permissions.json` 声明 allow/ask/deny，加规则不改代码；Hook 层仍然是程序化策略（改写路径/审计/更强拦截）。
+
+| 项 | 说明 |
+|---|---|
+| 规则文件 | 项目根 `permissions.json`（与 hooks.json 同层；缺失/坏 JSON 回退内置默认，默认档 ask） |
+| 规则语法 | `Tool` 精确、`Tool(参数glob)`、`A\|B` 备选、`*` 通配（如 `Shell(git push*\|git commit*)`、`Write(.env*)`、`mcp__*`） |
+| 优先级 | **deny > ask > allow**（档位优先，与规则顺序无关）；同档内第一个命中生效 |
+| default | 未命中规则的兜底档（默认 `ask`） |
+| ask 确认 | TTY 输入 y 才继续；**非交互 fail-closed**；确认后 Hook 层的同类 ask（如高敏命令）不再重复弹窗 |
+| 模式 | `mode` 字段或 `YOLO=1`（env 优先）：ask 自动放行，**deny 永远生效** |
+| 交互 | `/permissions` 查看规则；`/permissions test <工具> [参数JSON]` 试匹配（如 `test Shell {"command":"git push"}`） |
+
+实现：`src/bc_code_agent/permissions.py`（PermissionsConfig / rule_matches / PermissionVerdict）。
+
+决策管道：`permissions.json`（声明式）→ `PreToolUse` hooks（程序式，照旧可 deny/ask/改写输入）→ 执行 → `PostToolUse`（审计/截断）。
+
+### 实录（2026-08-23，session=`20260824-003145`）
+
+```text
+Enter a prompt: /permissions
+Permission rules (mode=interactive, default=ask):
+  [allow] Read|Grep|Glob|LoadSkill|WebSearch
+  ...
+  [deny] Shell(rm -rf*)
+  [deny] Write(.env*)
+  [ask] Shell(git push*|git commit*)
+  [allow] Shell(*)
+  [allow] mcp__*
+
+Enter a prompt: /permissions test Shell {"command":"git push origin main"}
+Shell → ask（规则: Shell(git push*|git commit*)）
+
+Enter a prompt: /permissions test Shell {"command":"rm -rf /"}
+Shell → deny（规则: Shell(rm -rf*)）
+
+Enter a prompt: 运行 git push origin main 并汇报结果
+[permission] 工具调用 Shell 匹配规则「Shell(git push*|git commit*)」：需要确认
+[permission] 当前不是交互式终端，默认拒绝执行。   ← 非交互 fail-closed
+[Agent]: 主人，这次推送被拦下来了喵～（没有真正执行 push）
+
+Enter a prompt: 运行 rm -rf / 看看会怎样
+[Agent]: 这个奴家绝对不能执行喵！！（危险 Shell 被 deny，模型拒绝尝试）
+```
+
+**YOLO 模式**（`YOLO=1` 启动）：
+
+```text
+[Permission] YOLO=1：ask 项自动放行，deny 仍生效
+[Permission] YOLO 模式自动放行: 工具调用 Shell 匹配规则「Shell(echo yolo*)」：需要确认
+[Shell]: command='echo yolo-demo' → 执行成功
+```
+
+要点：
+
+1. **声明式**：加规则 = 改 `permissions.json`，无需动 Python；内置默认与文件缺一不可（缺失时用内置）
+2. **deny 是安全底线**：YOLO 只影响 ask；`rm -rf*`、写 `.env` 永远拒绝
+3. **fail-closed**：非交互终端（如后台/AFK）碰 ask 默认拒绝，不会静默放行
+4. **与 Step 12 Hook 分工**：权限管「放行/询问/拒绝」的纯决策；Hook 管「策略细节」（路径改写、审计、截断）
+5. **防双确认**：权限层 ask 已确认时，`tool_policy` 的高敏 ask 自动跳过
+
 ## 后续规划
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / **goal loop（Step 14）**。  
-差的是后半程：无人值守闸门、并行与编排收口。排序原则：
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / **permission 管道（Step 15）**。  
+差的是后半程：并行与编排收口。排序原则：
 
 1. 先改循环的停法，再加外围调度（已完成：Step 14）  
-2. Goal 会长时间自己调工具，闸门要够用（下一步：15 Permission 硬闸）  
+2. 无人值守闸门已齐（Step 15：权限 + YOLO；配合 Step 12 Hook）  
 3. Team 抢任务 / worktree 依赖任务图，不要提前做  
 
 ```text
-现在 (Chat loop + Hooks + Session 续聊 + Goal Loop)
-    → 15 Permission（给无人值守加硬闸）
-         → 16 Background Shell（给长命令让路）
+现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop)
+    → 16 Background Shell（给长命令让路）
     → 17 Task 图 → 18 Team 抢任务/worktree
     → 19 Cron（发现工作）
     → 20 Workflow（固定路径用代码编）
@@ -714,7 +775,7 @@ Enter a prompt: （输入任意内容即继续）
 | Step | 做什么 | 为什么排这里 | MVP |
 |---|---|---|---|
 | 14 Goal Loop ✅ | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `goal.json` + block 上限 + 独立评估器 |
-| 15 Permission | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认 |
+| 15 Permission ✅ | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认；YOLO=1 |
 | 16 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
 | 17 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
 | 18 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
@@ -751,6 +812,9 @@ REASONING_EFFORT=high
 # GOAL_EVALUATOR_MODEL=glm-4-flash
 # GOAL_EVALUATOR_MAX_TOKENS=512
 # GOAL_BLOCK_CAP=8
+
+# Permission（Step 15）：YOLO=1 让 ask 自动放行（deny 仍生效），无人值守时用
+# YOLO=1
 ```
 
 ```bash

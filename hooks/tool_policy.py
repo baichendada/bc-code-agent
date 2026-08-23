@@ -68,6 +68,7 @@ def main() -> int:
 
     tool_name = data.get("tool_name") or ""
     tool_input = dict(data.get("tool_input") or {})
+    permission_approved = bool(data.get("permission_approved"))
 
     if tool_name == "Shell":
         command = str(tool_input.get("command") or "")
@@ -79,7 +80,8 @@ def main() -> int:
             _emit("deny", reason)
             return 0
         high = _match(command, HIGH_SENSITIVITY)
-        if high:
+        # 权限层（permissions.json）已确认的 ask 不再重复弹窗
+        if high and not permission_approved:
             _, description = high
             _emit("ask", f"需要确认：{description}。命令：{command[:120]}")
             return 0

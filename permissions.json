@@ -1,0 +1,15 @@
+{
+  "default": "ask",
+  "mode": "interactive",
+  "rules": [
+    { "match": "Read|Grep|Glob|LoadSkill|WebSearch", "decision": "allow" },
+    { "match": "TodoRead|TodoWrite", "decision": "allow" },
+    { "match": "ListTeammates|ReadInbox|SendMessage|Broadcast", "decision": "allow" },
+    { "match": "Spawn|DisbandTeam|Task", "decision": "allow" },
+    { "match": "Shell(rm -rf*)", "decision": "deny" },
+    { "match": "Write(.env*)", "decision": "deny" },
+    { "match": "Shell(git push*|git commit*)", "decision": "ask" },
+    { "match": "Shell(*)", "decision": "allow" },
+    { "match": "mcp__*", "decision": "allow" }
+  ]
+}
