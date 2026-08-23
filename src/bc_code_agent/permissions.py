@@ -33,6 +33,9 @@ DEFAULT_RULES: list[dict[str, str]] = [
     {"match": "Shell(*)", "decision": "allow"},
     # MCP 默认放行（规则可收紧为 ask）
     {"match": "mcp__*", "decision": "allow"},
+    # Cron 工具（Step 19）：查看放行；注册/取消是敏感操作 → ask
+    {"match": "ListCrons", "decision": "allow"},
+    {"match": "ScheduleCron|CancelCron", "decision": "ask"},
 ]
 
 DECISIONS = ("deny", "ask", "allow")

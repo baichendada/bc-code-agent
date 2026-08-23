@@ -2,10 +2,12 @@ import os
 import sys
 import atexit
 import time
-import argparse
 import json
+import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ from goal import (
 )
 from permissions import PermissionsConfig
 from bg_jobs import BACKGROUND, format_task_list, install_cleanup
+from cron import CRON_TOOL_SCHEMAS, CronError, CronStore, format_status_message
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -232,6 +235,11 @@ Background（后台任务）规则：
 1. 只有“独立、不阻塞后续步骤”的慢命令才用 Shell(background=true)（如安装依赖、完整测试套件）；后续步骤依赖其结果的命令必须同步执行。
 2. 后台调用立即返回任务 id（如 bg_0001）；完成结果会在后续轮次以 [Background] 通知注入对话，收到后据此继续。
 3. 用 /bg 查看任务状态；/bg kill <id> 可停止。子 Agent 不支持后台（会降级为同步执行）。
+
+Cron（定时任务）规则：
+1. 需要周期性执行的任务可注册 ScheduleCron（5 段表达式：分 时 日 月 周），到点会以 [Scheduled] 消息触发一轮。
+2. 定时轮中的权限 ask 默认拒绝（不抢终端确认）；需要放行请改 permissions.json 或设 YOLO=1。
+3. 用 ListCrons / CancelCron 查看与取消；主人也可用 /cron 管理。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -344,6 +352,7 @@ TOOLS = [
     },
     TASK_TOOL_SCHEMA,
     *TEAM_TOOL_SCHEMAS,
+    *CRON_TOOL_SCHEMAS,
 ]
 
 
@@ -427,6 +436,10 @@ def permission_gate(name: str, tool_input: dict) -> tuple[str | None, bool]:
     if verdict.decision == "deny":
         return f"[Permission: 拒绝] {verdict.reason}（匹配规则: {verdict.rule}）", False
     if verdict.decision == "ask":
+        if is_scheduled_turn():
+            # 定时轮不与主终端抢交互输入：ask 一律拒绝（可以配 YOLO 放行）
+            print(f"[Permission] 定时任务运行中，跳过交互确认 → 拒绝: {verdict.reason}")
+            return f"[Permission: 拒绝] 定时任务中未确认：{verdict.reason}", False
         if permissions.effective_mode() == "yolo":
             print(f"[Permission] YOLO 模式自动放行: {verdict.reason}")
             return None, True
@@ -478,6 +491,77 @@ if permissions.effective_mode() == "yolo":
 
 install_cleanup()
 
+# ---- Cron（Step 19）：存储 + 调度/投递线程 + agent_lock ----
+
+cron_store = CronStore(memory.dir / "cron.json")
+try:
+    cron_store.load()
+except CronError as exc:
+    raise SystemExit(str(exc)) from exc
+
+agent_lock = threading.Lock()          # 用户轮 / 定时轮互斥（scheduled turn 不抢终端）
+_SCHEDULED_TURN = threading.local()    # “当前是否定时轮”标记（权限 ask 不弹窗）
+_CRON_STOP = threading.Event()
+
+
+def is_scheduled_turn() -> bool:
+    return getattr(_SCHEDULED_TURN, "running", False)
+
+
+def cron_scheduler_loop() -> None:
+    """每秒检查到期任务 → 标记 pending + 落盘。"""
+    while not _CRON_STOP.wait(1.0):
+        try:
+            cron_store.poll_due(datetime.now())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Cron] 调度检查出错: {type(exc).__name__}: {exc}")
+
+
+def cron_queue_loop() -> None:
+    """0.2s 看一次：有到期任务且锁空闲 → 抢锁投递一轮 scheduled turn。"""
+    while not _CRON_STOP.wait(0.2):
+        if not agent_lock.acquire(blocking=False):
+            continue
+        try:
+            jobs = cron_store.take_pending()
+            if not jobs:
+                continue
+            text = format_status_message(jobs)
+            print(f"[Cron] 到点投递 {len(jobs)} 个定时任务")
+            run_turn({"role": "user", "content": text}, scheduled=True)
+            cron_store.ack(jobs)
+        finally:
+            agent_lock.release()
+
+
+def _start_cron_threads() -> None:
+    for target, name in ((cron_scheduler_loop, "cron-scheduler"), (cron_queue_loop, "cron-queue")):
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread.start()
+
+
+def _stop_cron_threads() -> None:
+    _CRON_STOP.set()
+
+
+def lead_cron_dispatch(name: str, tool_input: dict) -> str:
+    """模型侧 cron 工具：ScheduleCron / ListCrons / CancelCron。"""
+    if name == "ScheduleCron":
+        try:
+            job = cron_store.add(
+                str(tool_input.get("cron", "")),
+                str(tool_input.get("prompt", "")),
+                recurring=bool(tool_input.get("recurring", True)),
+            )
+            return f"已注册 {job.id}: {job.cron} → {job.prompt[:60]}"
+        except CronError as exc:
+            return f"[Cron] 注册失败: {exc}"
+    if name == "ListCrons":
+        return cron_store.list_text()
+    if name == "CancelCron":
+        return cron_store.remove(str(tool_input.get("id", "")))
+    return f"Unknown cron tool: {name}"
+
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
 TOOLS.extend(mcp_hub.tool_schemas)
@@ -500,6 +584,7 @@ main_executor = ToolExecutor(
     todo_read=todos.read,
     team_dispatch=lead_team_dispatch,
     mcp_dispatch=lead_mcp_dispatch,
+    cron_dispatch=lead_cron_dispatch,
 )
 
 HOOKS = load_hooks_from_config(
@@ -750,6 +835,233 @@ def handle_slash_command(raw: str) -> bool:
     return False
 
 
+def handle_cron_command(raw: str) -> bool:
+    """/cron：列表 / <5 段表达式> <prompt> 添加 / rm <id> / run-now <id> / pause|resume <id>。"""
+    line = raw.strip()
+    if not line.lower().startswith("/cron"):
+        return False
+    arg = line[len("/cron"):].strip()
+    if not arg:
+        print(cron_store.list_text() + "\n")
+        return True
+
+    cmd, _, rest = arg.partition(" ")
+    cmd_lower = cmd.lower()
+    rest = rest.strip()
+
+    if cmd_lower == "rm" and rest:
+        print(f"{cron_store.remove(rest.split()[0])}\n")
+        return True
+    if cmd_lower == "run-now" and rest:
+        job = cron_store.jobs.get(rest.split()[0])
+        if job is None:
+            print(f"任务不存在: {rest.split()[0]}\n")
+            return True
+        print(f"[Cron] 手动触发 {job.id}\n")
+        with agent_lock:
+            run_turn({"role": "user", "content": f"[Scheduled] {job.prompt}"}, scheduled=True)
+            cron_store.ack([job])
+        return True
+    if cmd_lower in ("pause", "resume") and rest:
+        enabled = cmd_lower == "resume"
+        print(f"{cron_store.set_enabled(rest.split()[0], enabled)}\n")
+        return True
+
+    # 添加：前 5 个 token 为表达式，其余为 prompt（prompt 可含空格，无需引号）
+    tokens = rest.split()
+    if len(tokens) >= 6:
+        expr = " ".join(tokens[:5])
+        prompt = " ".join(tokens[5:])
+        try:
+            job = cron_store.add(expr, prompt)
+        except CronError as exc:
+            print(f"[Cron] 添加失败: {exc}\n")
+            return True
+        print(f"[Cron] 已注册 {job.id}: {job.cron} → {job.prompt[:60]}\n")
+        return True
+
+    print("用法: /cron | /cron add <分 时 日 月 周> <prompt> | /cron rm <id> | /cron run-now <id> | /cron pause|resume <id>\n")
+    print("示例: /cron add */2 * * * * 运行 git status 并汇报当前分支状态\n")
+    return True
+
+
+def run_turn(user_msg: dict, scheduled: bool = False) -> None:
+    """注入一条消息并跑完整轮（内层 LLM + 工具循环直到停）。
+    用户轮与定时轮共用；scheduled=True 时权限 ask 不弹窗（不抢终端）。"""
+    global history
+    if scheduled:
+        _SCHEDULED_TURN.running = True
+    try:
+        history.append(user_msg)
+        memory.append_raw(user_msg)
+        persist_history()
+
+        stop_gate_retries = 0
+        while True:
+            history = memory.maybe_compact(history, client, MODEL)
+            inject_background(history)
+
+            turn_ctx: dict = {
+                "history": history,
+                "model": MODEL,
+                "turn": len(history),
+                "system_prompt": build_system_prompt(),
+            }
+            short = HOOKS.emit("before_turn", turn_ctx)
+            if isinstance(short, HookDecision):
+                if short.is_blocking:
+                    msg = short.to_message()
+                    assistant_msg = {"role": "assistant", "content": msg}
+                    history.append(assistant_msg)
+                    memory.append_raw(assistant_msg)
+                    persist_history()
+                    print(f"[Agent]: {msg}\n")
+                    break
+            elif isinstance(short, str):
+                assistant_msg = {"role": "assistant", "content": short}
+                history.append(assistant_msg)
+                memory.append_raw(assistant_msg)
+                persist_history()
+                print(f"[Agent]: {short}\n")
+                break
+
+            try:
+                message = create_with_retry(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    messages=history,
+                    system=turn_ctx.get("system_prompt", build_system_prompt()),
+                    tools=TOOLS,
+                    extra_body={
+                        "thinking": {"type": THINKING_TYPE},
+                        "reasoning_effort": REASONING_EFFORT,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg = (
+                    f"[API] 多次重试后仍失败：{type(exc).__name__}: {exc}\n"
+                    "本轮未执行。请稍后重试，或检查网络 / ANTHROPIC_BASE_URL。"
+                )
+                print(msg)
+                assistant_msg = {"role": "assistant", "content": msg}
+                history.append(assistant_msg)
+                memory.append_raw(assistant_msg)
+                persist_history()
+                break
+            track_usage(message, kind="chat")
+            turn_ctx.update({"message": message, "usage": getattr(message, "usage", None)})
+            HOOKS.emit("after_turn", turn_ctx)
+
+            assistant_msg = {"role": "assistant", "content": message.content}
+            history.append(assistant_msg)
+            memory.append_raw(assistant_msg)
+            persist_history()
+
+            if message.stop_reason != "tool_use":
+                reply = next((b.text for b in message.content if b.type == "text"), "")
+
+                if goal_controller.active is not None:
+                    decision = goal_controller.evaluate_after_turn(
+                        history, background_running=BACKGROUND.running() > 0
+                    )
+                    if decision.action == "defer":
+                        print("[Background] goal 等待后台任务完成...")
+                        wait_background(BACKGROUND)
+                        continue
+                    if decision.action == "block":
+                        print(f"[Goal] 未达成: {decision.reason}")
+                        reminder = {
+                            "role": "user",
+                            "content": (
+                                "[Goal 仍在进行]\n"
+                                f"条件: {goal_controller.active.condition}\n"
+                                f"评估器: {decision.reason}\n"
+                                "请继续工作，并把缺失的验证证据输出到对话中（例如命令与 exit code）。"
+                            ),
+                        }
+                        history.append(reminder)
+                        memory.append_raw(reminder)
+                        persist_history()
+                        continue
+                    label = ACTION_LABELS.get(decision.action, decision.action)
+                    print(f"[Goal] {label}: {decision.reason}")
+                    print(f"[Agent]: {reply}\n")
+                    break
+
+                stop_ctx = {
+                    "reply": reply,
+                    "history": history,
+                    "todos": [asdict(t) for t in todos.items],
+                    "retry": stop_gate_retries,
+                }
+                gate = HOOKS.emit("on_stop", stop_ctx)
+                if (
+                    isinstance(gate, HookDecision)
+                    and gate.is_blocking
+                    and stop_gate_retries < 1
+                ):
+                    print(f"[hook:stop_quality_gate] {gate.reason}")
+                    reminder = {
+                        "role": "user",
+                        "content": (
+                            "Stop Hook 阻止本轮结束："
+                            + gate.reason
+                            + "\n请继续完成未完成的步骤。若确实无法继续，请说明原因。"
+                        ),
+                    }
+                    history.append(reminder)
+                    memory.append_raw(reminder)
+                    persist_history()
+                    stop_gate_retries += 1
+                    continue
+
+                reply = stop_ctx.get("reply", reply)
+                print(f"[Agent]: {reply}\n")
+                history = memory.maybe_compact(history, client, MODEL)
+                persist_history()
+                break
+
+            tool_blocks = [b for b in message.content if b.type == "tool_use"]
+            task_blocks = [b for b in tool_blocks if b.name == "Task"]
+            other_blocks = [b for b in tool_blocks if b.name != "Task"]
+
+            results_map: dict[str, str] = {}
+
+            for block in other_blocks:
+                results_map[block.id] = execute_main_tool(block)
+
+            if len(task_blocks) > 1:
+                print(f"\n[并发派遣 {len(task_blocks)} 个子 Agent...]\n")
+                with ThreadPoolExecutor(max_workers=len(task_blocks)) as pool:
+                    for block_id, summary in pool.map(run_task_block, task_blocks):
+                        results_map[block_id] = summary
+                print()
+            else:
+                for block in task_blocks:
+                    block_id, summary = run_task_block(block)
+                    results_map[block_id] = summary
+
+            tool_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": results_map[block.id],
+                }
+                for block in tool_blocks
+            ]
+            tool_msg = {"role": "user", "content": tool_results}
+            history.append(tool_msg)
+            memory.append_raw(tool_msg)
+            persist_history()
+    finally:
+        if scheduled:
+            _SCHEDULED_TURN.running = False
+
+
+_start_cron_threads()
+atexit.register(_stop_cron_threads)
+
+
 while True:
     try:
         user_input = input("Enter a prompt: ")
@@ -768,6 +1080,8 @@ while True:
         # /goal <条件>：把条件本身作为本轮用户消息注入，立即开始工作
         user_msg = {"role": "user", "content": user_input[len("/goal"):].strip()}
     else:
+        if handle_cron_command(user_input):
+            continue
         if handle_permissions_command(user_input):
             continue
         if handle_background_command(user_input):
@@ -776,165 +1090,5 @@ while True:
             continue
         user_msg = {"role": "user", "content": user_input}
 
-    history.append(user_msg)
-    memory.append_raw(user_msg)
-    persist_history()
-
-    stop_gate_retries = 0
-    while True:
-        history = memory.maybe_compact(history, client, MODEL)
-        inject_background(history)
-
-        turn_ctx: dict = {
-            "history": history,
-            "model": MODEL,
-            "turn": len(history),
-            "system_prompt": build_system_prompt(),
-        }
-        short = HOOKS.emit("before_turn", turn_ctx)
-        if isinstance(short, HookDecision):
-            if short.is_blocking:
-                msg = short.to_message()
-                assistant_msg = {"role": "assistant", "content": msg}
-                history.append(assistant_msg)
-                memory.append_raw(assistant_msg)
-                persist_history()
-                print(f"[Agent]: {msg}\n")
-                break
-        elif isinstance(short, str):
-            assistant_msg = {"role": "assistant", "content": short}
-            history.append(assistant_msg)
-            memory.append_raw(assistant_msg)
-            persist_history()
-            print(f"[Agent]: {short}\n")
-            break
-
-        try:
-            message = create_with_retry(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                messages=history,
-                system=turn_ctx.get("system_prompt", build_system_prompt()),
-                tools=TOOLS,
-                extra_body={
-                    "thinking": {"type": THINKING_TYPE},
-                    "reasoning_effort": REASONING_EFFORT,
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            msg = (
-                f"[API] 多次重试后仍失败：{type(exc).__name__}: {exc}\n"
-                "本轮未执行。请稍后重试，或检查网络 / ANTHROPIC_BASE_URL。"
-            )
-            print(msg)
-            assistant_msg = {"role": "assistant", "content": msg}
-            history.append(assistant_msg)
-            memory.append_raw(assistant_msg)
-            persist_history()
-            break
-        track_usage(message, kind="chat")
-        turn_ctx.update({"message": message, "usage": getattr(message, "usage", None)})
-        HOOKS.emit("after_turn", turn_ctx)
-
-        assistant_msg = {"role": "assistant", "content": message.content}
-        history.append(assistant_msg)
-        memory.append_raw(assistant_msg)
-        persist_history()
-
-        if message.stop_reason != "tool_use":
-            reply = next((b.text for b in message.content if b.type == "text"), "")
-
-            if goal_controller.active is not None:
-                decision = goal_controller.evaluate_after_turn(
-                    history, background_running=BACKGROUND.running() > 0
-                )
-                if decision.action == "defer":
-                    # 后台任务仍在跑：等它完成（collect 后有通知，下一轮注入）
-                    print("[Background] goal 等待后台任务完成...")
-                    wait_background(BACKGROUND)
-                    continue
-                if decision.action == "block":
-                    print(f"[Goal] 未达成: {decision.reason}")
-                    reminder = {
-                        "role": "user",
-                        "content": (
-                            "[Goal 仍在进行]\n"
-                            f"条件: {goal_controller.active.condition}\n"
-                            f"评估器: {decision.reason}\n"
-                            "请继续工作，并把缺失的验证证据输出到对话中（例如命令与 exit code）。"
-                        ),
-                    }
-                    history.append(reminder)
-                    memory.append_raw(reminder)
-                    persist_history()
-                    continue
-                label = ACTION_LABELS.get(decision.action, decision.action)
-                print(f"[Goal] {label}: {decision.reason}")
-                print(f"[Agent]: {reply}\n")
-                break
-
-            stop_ctx = {
-                "reply": reply,
-                "history": history,
-                "todos": [asdict(t) for t in todos.items],
-                "retry": stop_gate_retries,
-            }
-            gate = HOOKS.emit("on_stop", stop_ctx)
-            if (
-                isinstance(gate, HookDecision)
-                and gate.is_blocking
-                and stop_gate_retries < 1
-            ):
-                print(f"[hook:stop_quality_gate] {gate.reason}")
-                reminder = {
-                    "role": "user",
-                    "content": (
-                        "Stop Hook 阻止本轮结束："
-                        + gate.reason
-                        + "\n请继续完成未完成的步骤。若确实无法继续，请说明原因。"
-                    ),
-                }
-                history.append(reminder)
-                memory.append_raw(reminder)
-                persist_history()
-                stop_gate_retries += 1
-                continue
-
-            reply = stop_ctx.get("reply", reply)
-            print(f"[Agent]: {reply}\n")
-            history = memory.maybe_compact(history, client, MODEL)
-            persist_history()
-            break
-
-        tool_blocks = [b for b in message.content if b.type == "tool_use"]
-        task_blocks = [b for b in tool_blocks if b.name == "Task"]
-        other_blocks = [b for b in tool_blocks if b.name != "Task"]
-
-        results_map: dict[str, str] = {}
-
-        for block in other_blocks:
-            results_map[block.id] = execute_main_tool(block)
-
-        if len(task_blocks) > 1:
-            print(f"\n[并发派遣 {len(task_blocks)} 个子 Agent...]\n")
-            with ThreadPoolExecutor(max_workers=len(task_blocks)) as pool:
-                for block_id, summary in pool.map(run_task_block, task_blocks):
-                    results_map[block_id] = summary
-            print()
-        else:
-            for block in task_blocks:
-                block_id, summary = run_task_block(block)
-                results_map[block_id] = summary
-
-        tool_results = [
-            {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": results_map[block.id],
-            }
-            for block in tool_blocks
-        ]
-        tool_msg = {"role": "user", "content": tool_results}
-        history.append(tool_msg)
-        memory.append_raw(tool_msg)
-        persist_history()
+    with agent_lock:
+        run_turn(user_msg)

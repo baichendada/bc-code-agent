@@ -22,7 +22,7 @@
 - [x] **Step 16**：Background Shell（慢命令后台 + 完成通知）
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
 - [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
-- [ ] **Step 19**：Cron（到点触发）
+- [x] **Step 19**：Cron（到点触发）
 - [ ] **Step 20**：Workflow Runtime（固定编排脚本 + journal 可 resume）
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
@@ -858,19 +858,76 @@ Enter a prompt: /bg
 
 6. **kill 的 fail-safe**：不存在的 / 已结束的任务 id 会明确回报，不会误杀其它任务
 
+## Step 19：Cron 定时调度
+
+「发现工作」：cron 到点把 prompt 注入主循环，跑一轮完整 agent turn（工具/权限/Goal/后台全部照常）。
+
+| 项 | 说明 |
+|---|---|
+| 表达式 | 5 段（分 时 日 月 周）：`*` / `*/N` / `N` / `N-M` / `N,M,...`；weekday 0=周日；`validate_cron()` 范围校验 |
+| 触发架构 | **调度线程**（每秒 poll_due → 标记 pending + 落盘）+ **队列处理器**（0.2s 抢 `agent_lock` → 投递 `[Scheduled] prompt` 跑一轮 → ack）；主线程 `input()` 不持锁，定时轮可在用户发呆时自动跑 |
+| 互斥 | 用户轮 / 定时轮一把锁：用户输入时 cron 跳过（0.2s 重试）；cron 轮在跑时用户轮排队 |
+| 定时轮权限 | ask **不弹窗直接拒绝**（不抢主终端确认；YOLO=1 可放行） |
+| 命令 | `/cron`（列表）/ `/cron add <5 段表达式> <prompt>` / `/cron rm <id>` / `/cron run-now <id>` / `/cron pause\|resume <id>` |
+| 工具 | `ScheduleCron` / `ListCrons` / `CancelCron`（模型侧）；子 Agent/队友不可用 |
+| 持久化 | `sessions/<id>/cron.json`（原子写；损坏 → 启动报错 fail-closed）；停机错过的时刻**不补跑**；MVP 为「最多一次投递」（轮结束即 ack） |
+
+实现：`src/bc_code_agent/cron.py`（CronStore / validate / matches）+ `start.py`（run_turn 函数化 + agent_lock + 双线程）。
+
+### 实录（2026-08-24，session=`20260824-023112` 等）
+
+**命令链路（注册 / 列表 / run-now）：**
+
+```text
+Enter a prompt: /cron add */1 * * * * 运行 date 并汇报当前时间
+[Cron] 已注册 c_0001: */1 * * * * → 运行 date 并汇报当前时间
+
+Enter a prompt: /cron
+id        cron                  状态    prompt
+c_0001    */1 * * * *           运行    运行 date 并汇报当前时间
+
+Enter a prompt: /cron run-now c_0001
+[Cron] 手动触发 c_0001
+[Agent]: 主人～奴家查好啦，向您汇报当前时间喵～ 2026年8月24日（星期一）凌晨 02:30:52
+```
+
+**每分钟自动投递（用户全程不输入）：**
+
+```text
+[Cron] 到点投递 1 个定时任务
+[Agent]: 当前时间：2026-08-24 02:31:21 ...
+[Cron] 到点投递 1 个定时任务
+[Agent]: 当前时间：2026-08-24 02:32:02 ...
+```
+
+**模型工具通道（ScheduleCron → ListCrons → CancelCron）：**
+
+```text
+[ScheduleCron]: {'cron': '*/5 * * * *', 'prompt': '执行 Shell 命令 git status 检查当前仓库状态...'}
+[result]: 已注册 c_0001: */5 * * * * → 执行 Shell 命令 git status 检查当前仓库状态...
+[ListCrons]: {} → id 列表
+[CancelCron]: {'id': 'c_0001'} → 已删除
+```
+
+要点：
+
+1. **调度与执行分离**：CronStore 只回答「何时到点」（pending+last_fired 防重），投递/轮次复用现有 run_turn
+2. **三线程模型**：调度 / 队列处理器 / 主输入；`agent_lock` 非阻塞抢占决定谁跑（用户轮优先，cron 轮排队）
+3. **定时轮不等于命令**：到点触发的是完整 agent turn，[Scheduled] 消息后的工具/Goal/权限全部照常
+4. **边界**：进程活着才调度；真无人值守 → 系统任务计划器/crontab 配合 `--session`（README 有说明）
+
 ## 后续规划
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / permission 管道 / **background shell（Step 16）**。  
-差的是后半程：任务编排与收口。排序原则：
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / permission 管道 / background shell / **cron 调度（Step 19）**。  
+差的是最后一块：固定路径的收口。排序原则：
 
 1. 先改循环的停法，再加外围调度（已完成：Step 14）  
 2. 无人值守闸门已齐（Step 15：权限 + YOLO；配合 Step 12 Hook）  
 3. 长命令已让路（Step 16：后台任务 + Goal defer）  
+4. 到点触发已就位（Step 19：cron → 完整 agent turn）  
 
 ```text
-现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop + Background)
-    → 17 Task 图 → 18 Team 抢任务/worktree
-    → 19 Cron（发现工作）
+现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop + Background + Cron)
     → 20 Workflow（固定路径用代码编）
 ```
 
@@ -879,9 +936,9 @@ Enter a prompt: /bg
 | 14 Goal Loop ✅ | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `goal.json` + block 上限 + 独立评估器 |
 | 15 Permission ✅ | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认；YOLO=1 |
 | 16 Background Shell ✅ | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
-| 17 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
-| 18 Team v2 | 原子领取 + worktree | 有图才能抢；有 worktree 才不互踩文件 | 领取 CAS；每任务一个 worktree |
-| 19 Cron | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 inbox/`/goal` 丢一条 |
+| 17 Task 图 ⏸ | 落盘任务 + `blockedBy` | 多执行者协作（Step 18 前置）；单人场景暂缓 | `tasks.jsonl`；`/tasks` |
+| 18 Team v2 ⏸ | 原子领取 + worktree | 依赖任务图；暂缓 | 领取 CAS；每任务一个 worktree |
+| 19 Cron ✅ | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 `/goal` 丢一条 |
 | 20 Workflow | 固定编排用脚本 + journal | 路径固定时别再让模型每步想 | 一种：测→改→再测，断点可续 |
 
 不要抢跑：先做 Cron/Workflow（没有 Goal 仍是跑一轮就停）；先做 worktree（没有任务图就没有领取对象）；把 Todo 当成 Goal（Todo 是 checklist，Goal 是宿主外循环 + 核验器）。

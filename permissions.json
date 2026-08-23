@@ -1,6 +1,6 @@
 {
   "default": "ask",
-  "mode": "yolo",
+  "mode": "interactive",
   "rules": [
     { "match": "Read|Grep|Glob|LoadSkill|WebSearch", "decision": "allow" },
     { "match": "TodoRead|TodoWrite", "decision": "allow" },
@@ -10,6 +10,8 @@
     { "match": "Write(.env*)", "decision": "deny" },
     { "match": "Shell(git push*|git commit*)", "decision": "ask" },
     { "match": "Shell(*)", "decision": "allow" },
-    { "match": "mcp__*", "decision": "allow" }
+    { "match": "mcp__*", "decision": "allow" },
+    { "match": "ListCrons", "decision": "allow" },
+    { "match": "ScheduleCron|CancelCron", "decision": "ask" }
   ]
 }
