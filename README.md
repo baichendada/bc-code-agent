@@ -640,28 +640,58 @@ Enter a prompt: 暗号是什么
 3. **预算放 Goal 外面**：Goal 不藏默认轮数预算；上限只是「暂停自动续跑」，用户可继续/换条件/清除
 4. **默认同主模型**：`.env` 可换 `GOAL_EVALUATOR_MODEL`（如 glm-4-flash 省钱）；评估输入是对话文本、输出短 JSON（512 token 上限即可）
 
-### 实录（2026-08-23，session=`20260823-232628`）
+### 实录（2026-08-23，session=`20260823-233656`）
+
+**场景 1：达成 —— date 查询**
 
 ```text
 Enter a prompt: /goal 运行 date 命令并汇报当前时间结果
 [Goal] 激活: 运行 date 命令并汇报当前时间结果
 
 [Shell]: command='powershell -NoProfile -Command "Get-Date -Format ..."'
-[result]: 2026-08-23 23:26:43 (星期日)
-[Shell]: command='powershell -NoProfile -Command "(Get-Date).DayOfWeek"'
-[result]: Sunday
-[Token] goal_eval: in=466 out=59
-[Goal] 达成: 助手通过 PowerShell 等效命令查询了当前日期时间，并在回复中明确汇报了结果：
-          2026年8月23日 星期日 23:26:43，满足条件。
-[Agent]: 汇报完毕，主人喵～ （当前时间 + 说明 Windows 下 date 是设置命令所以改用 PowerShell）
+[result]: 2026-08-23 23:37:11 (星期日)
+[Token] goal_eval: in=384 out=196
+[Goal] 达成: ...工具结果中显示了完整时间 2026-08-23 23:37:11（星期日），且已将结果汇报...
+[Agent]: 主人，时间查好啦喵～（当前时间 + 说明 Windows 下 date 是设置命令所以改用 PowerShell）
+```
+
+**场景 2：Todo 协同 —— 全部 .py 编译检查**
+
+```text
+Enter a prompt: /goal 检查项目所有 .py 文件能否通过编译（运行编译命令并汇报结果）
+[Goal] 激活: ...
+[TodoWrite]: 3 步（Glob 找出所有 .py → 运行 compileall 检查语法 → 汇报结果）
+[Glob]: pattern='**/*.py' → 25 个文件
+[Shell]: command='python -m compileall -q hooks src tests & echo EXIT_CODE=%ERRORLEVEL%'
+[result]: EXIT_CODE=0
+[Token] goal_eval: in=1577 out=65
+[Goal] 达成: ...退出码为 0 且无错误输出，并汇报了结果，完成条件满足。
+[Agent]: 主人，检查全部完成啦...（25 个 .py 全部通过）
+```
+
+**场景 3：中断恢复 —— Ctrl+C 后 --session 续跑**
+
+```text
+Enter a prompt: /goal 运行 ls 并汇报当前目录内容
+[Goal] 激活: ...
+（模型正在发请求时 Ctrl+C 退出）
+
+$ python src/bc_code_agent/start.py --session 20260823-233656
+[Memory] restored 17 working message(s)
+[Goal] restored active goal: 运行 ls 并汇报当前目录内容
+Enter a prompt: （输入任意内容即继续）
+[Shell]: command='dir' → 目录列表已返回
+[Token] goal_eval: in=2387 out=29
+[Goal] 达成: ls/dir 已运行并详细汇报了当前目录内容
 ```
 
 要点：
 
-1. **激活即开工**：`/goal` 后模型自动连续多轮（本例 2 轮 Shell），不需要再输入「继续」
-2. **独立核验才停**：`[Token] goal_eval` 出现即停前最后一道闸；`[Goal] 达成` 才收工
-3. **评估器读的是对话**：模型要把命令与结果说清楚（system 里有对应规则），否则评估器判「缺证据」→ block → 继续
-4. **达成后 goal.json 记录 met**，`/goal` 可回看历史结果
+1. **激活即开工**：`/goal` 后模型自动连续多轮，不需要再输入「继续」；中途 Ctrl+C 后带 `--session` 重启，goal 状态从 `goal.json` 恢复并续跑
+2. **独立核验才停**：每轮要停时出现 `[Token] goal_eval`（停前最后一道闸）；`[Goal] 达成` 才收工
+3. **评估器读的是对话**：`EXIT_CODE=0`、命令输出这些证据必须在对话里（model 把命令与结果说清楚），否则评估器判「缺证据」→ block → 继续
+4. **与 Todo 协同**：goal 期间的复杂任务照样先 TodoWrite 拆步，两个机制互不干扰
+5. **达成后 goal.json 记录 met**，`/goal` 可回看历史结果；`/goal clear` 对已达成/未激活的 goal 报「当前没有激活的 goal」
 
 ## 后续规划
 
