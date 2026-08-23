@@ -706,10 +706,13 @@ Enter a prompt: （输入任意内容即继续）
 | ask 确认 | TTY 输入 y 才继续；**非交互 fail-closed**；确认后 Hook 层的同类 ask（如高敏命令）不再重复弹窗 |
 | 模式 | `mode` 字段或 `YOLO=1`（env 优先）：ask 自动放行，**deny 永远生效** |
 | 交互 | `/permissions` 查看规则；`/permissions test <工具> [参数JSON]` 试匹配（如 `test Shell {"command":"git push"}`） |
+| 覆盖范围 | **同一套闸**：主 Agent 工具、Task（工具本身）、Task 子 Agent 内部工具、AgentTeam 队友 —— 全部经过共享执行器内的 `permission_gate` |
+| 配置安全 | `permissions.json` 已存在但 JSON 损坏 → **启动失败**（fail-closed），不静默降级为宽松内置；只有文件不存在时才用内置默认 |
+| ask 审查 | 确认弹窗会展示实际工具参数（`command`/`path` 等，超长截断），不是只给规则名 |
 
 实现：`src/bc_code_agent/permissions.py`（PermissionsConfig / rule_matches / PermissionVerdict）。
 
-决策管道：`permissions.json`（声明式）→ `PreToolUse` hooks（程序式，照旧可 deny/ask/改写输入）→ 执行 → `PostToolUse`（审计/截断）。
+决策管道：`permissions.json`（声明式）→ `PreToolUse` hooks（程序式，照旧可 deny/ask/改写输入；仅主 Agent 有 Hook 链）→ 共享执行器执行（子 Agent / 队友在自身 context 内同样过 `permission_gate`）→ `PostToolUse`（审计/截断）。
 
 ### 实录（2026-08-23，session=`20260824-003145`）
 
@@ -739,12 +742,25 @@ Enter a prompt: 运行 rm -rf / 看看会怎样
 [Agent]: 这个奴家绝对不能执行喵！！（危险 Shell 被 deny，模型拒绝尝试）
 ```
 
+**子 Agent 与 Task 同样过闸**（临时规则演示：`Shell(echo should*)` deny、`Task(subagent_type=general)` deny）：
+
+```text
+[Task]: subagent_type='general', description='运行指定 echo 命令', ...
+[子·general·Shell]: command='echo should-be-blocked-xyz'
+→ [Permission: 拒绝] 工具调用 Shell 匹配规则「Shell(echo should*)」：已拒绝
+[子 Agent 汇报]: 命令被拦截，未实际执行；不会尝试绕过
+
+（Task 被拒时模型的行为）
+[Task 被规则 Task(subagent_type=general) 拒绝]
+[Agent]: 原计划 Task 委派 general；实际改用主 Agent Shell 直接运行（Task 被权限规则拒绝）
+```
+
 **YOLO 模式**（`YOLO=1` 启动）：
 
 ```text
 [Permission] YOLO=1：ask 项自动放行，deny 仍生效
 [Permission] YOLO 模式自动放行: 工具调用 Shell 匹配规则「Shell(echo yolo*)」：需要确认
-[Shell]: command='echo yolo-demo' → 执行成功
+[Shell]: command='echo yolo-demo' → 执行成功（且已标记 permission_approved，Hook 层不二次询问）
 ```
 
 要点：
@@ -752,8 +768,10 @@ Enter a prompt: 运行 rm -rf / 看看会怎样
 1. **声明式**：加规则 = 改 `permissions.json`，无需动 Python；内置默认与文件缺一不可（缺失时用内置）
 2. **deny 是安全底线**：YOLO 只影响 ask；`rm -rf*`、写 `.env` 永远拒绝
 3. **fail-closed**：非交互终端（如后台/AFK）碰 ask 默认拒绝，不会静默放行
-4. **与 Step 12 Hook 分工**：权限管「放行/询问/拒绝」的纯决策；Hook 管「策略细节」（路径改写、审计、截断）
-5. **防双确认**：权限层 ask 已确认时，`tool_policy` 的高敏 ask 自动跳过
+4. **配置损坏也 fail-closed**：已存在文件解析失败 → 启动失败并提示修复/删除，不会悄悄降级为宽松内置
+5. **与 Step 12 Hook 分工**：权限管「放行/询问/拒绝」的纯决策；Hook 管「策略细节」（路径改写、审计、截断）
+6. **防双确认**：权限层 ask 已确认时（含 YOLO 放行），`tool_policy` 的高敏 ask 自动跳过
+7. **拒绝后不绕行**：模型收到 `[Permission: 拒绝]` 会换合规路径（如改用未被禁的工具），而不是硬顶规则
 
 ## 后续规划
 

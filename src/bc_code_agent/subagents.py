@@ -170,6 +170,7 @@ def run_subagent(
     thinking_type: str,
     reasoning_effort: str,
     track_usage: Callable[[Any, str], None] | None = None,
+    permission_checker: Callable[[str, dict], str | None] | None = None,
 ) -> str:
     if profile not in PROFILES:
         return f"Unknown subagent_type: {profile!r}. Known: {', '.join(SUBAGENT_TYPES)}"
@@ -183,6 +184,7 @@ def run_subagent(
         prefix=f"子·{profile}·",
         load_skill=load_skill,
         web_search=web_search,
+        permission_checker=permission_checker,
     )
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt.strip()}]

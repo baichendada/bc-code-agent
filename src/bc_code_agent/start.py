@@ -394,6 +394,48 @@ def track_usage(message, kind: str) -> None:
     )
 
 
+def confirm_permission(verdict, tool_name: str, tool_input: dict) -> bool:
+    """ask 决策：展示实际工具参数，TTY 输入 y 才继续；非交互 fail-closed。"""
+    preview = brief_tool_input(tool_name, tool_input)
+    print(f"\n[permission] {verdict.reason}")
+    print(f"[permission] 参数：{preview}")
+    if not sys.stdin.isatty():
+        print("[permission] 当前不是交互式终端，默认拒绝执行。\n")
+        return False
+    try:
+        answer = input(
+            "[permission] 是否继续执行？输入 y 继续，其余取消: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
+def permission_gate(name: str, tool_input: dict) -> tuple[str | None, bool]:
+    """统一权限闸门：主 Agent 工具、Task 子 Agent、AgentTeam 队友共用。
+
+    返回 (拒绝消息 | None, 是否已确认放行)；消息为 None 表示放行。
+    """
+    verdict = permissions.check(name, tool_input)
+    if verdict.decision == "deny":
+        return f"[Permission: 拒绝] {verdict.reason}（匹配规则: {verdict.rule}）", False
+    if verdict.decision == "ask":
+        if permissions.effective_mode() == "yolo":
+            print(f"[Permission] YOLO 模式自动放行: {verdict.reason}")
+            return None, True
+        if confirm_permission(verdict, name, tool_input):
+            return None, True
+        return f"[Permission: 拒绝] 用户未确认：{verdict.reason}", False
+    return None, False
+
+
+def executor_permission_checker(name: str, tool_input: dict) -> str | None:
+    """共享执行器的权限钩子（子 Agent / 队友）：返回非 None 即拒绝。"""
+    msg, _approved = permission_gate(name, tool_input)
+    return msg
+
+
 team = AgentTeamManager(
     team_store,
     client=client,
@@ -404,6 +446,7 @@ team = AgentTeamManager(
     load_skill=skill_loader.view,
     web_search=web_search,
     track_usage=track_usage,
+    permission_checker=executor_permission_checker,
 )
 atexit.register(team.shutdown)
 if team_store.has_active_team():
@@ -459,42 +502,17 @@ HOOKS = load_hooks_from_config(
 HOOKS.emit("on_session_start", {"session_dir": str(memory.dir)})
 
 
-def confirm_permission(verdict) -> bool:
-    """ask 决策：TTY 输入 y 才继续；非交互 fail-closed。"""
-    print(f"\n[permission] {verdict.reason}")
-    if not sys.stdin.isatty():
-        print("[permission] 当前不是交互式终端，默认拒绝执行。\n")
-        return False
-    try:
-        answer = input(
-            "[permission] 是否继续执行？输入 y 继续，其余取消: "
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return answer in ("y", "yes")
-
-
 def execute_main_tool(block) -> str:
     """主 Agent 工具入口：声明式权限 → Hook 链 → 执行。"""
     name = block.name
     inp = dict(block.input)
 
-    # 声明式权限（Step 15）：deny 直接拒绝；ask 需确认；allow 放行
-    verdict = permissions.check(name, inp)
-    permission_approved = False
-    if verdict.decision == "deny":
-        return f"[Permission: 拒绝] {verdict.reason}（匹配规则: {verdict.rule}）"
-    if verdict.decision == "ask":
-        if permissions.effective_mode() == "yolo":
-            print(f"[Permission] YOLO 模式自动放行: {verdict.reason}")
-        elif confirm_permission(verdict):
-            permission_approved = True
-        else:
-            return f"[Permission: 拒绝] 用户未确认：{verdict.reason}"
+    blocked, approved = permission_gate(name, inp)
+    if blocked is not None:
+        return blocked
 
     tool_ctx: dict = {"name": name, "input": inp}
-    if permission_approved:
+    if approved:
         # 权限层已确认：Hook 层的同类 ask（如 tool_policy 的高敏命令）不再重复弹窗
         tool_ctx["permission_approved"] = True
     decision = HOOKS.emit("before_tool_call", tool_ctx, tool_matcher=name)
@@ -550,11 +568,16 @@ def execute_task(tool_input: dict) -> str:
         thinking_type=THINKING_TYPE,
         reasoning_effort=REASONING_EFFORT,
         track_usage=track_usage,
+        permission_checker=executor_permission_checker,
     )
 
 
 def run_task_block(block) -> tuple[str, str]:
     tool_input = dict(block.input)
+    # Task 本身也过权限闸（P1：防止通过 Task 绕过 Shell/Write 规则）
+    blocked, _approved = permission_gate("Task", tool_input)
+    if blocked is not None:
+        return block.id, blocked
     print(f"[Task]: {brief_tool_input('Task', tool_input)}")
     summary = execute_task(tool_input)
     print(f"[主上下文压缩]: 子 Agent 回传 {len(summary)} 字")

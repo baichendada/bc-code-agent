@@ -63,6 +63,7 @@ class ToolExecutor:
         todo_read: Callable[[], str] | None = None,
         team_dispatch: Callable[[str, dict], str] | None = None,
         mcp_dispatch: Callable[[str, dict], str] | None = None,
+        permission_checker: Callable[[str, dict], str | None] | None = None,
         log: bool = True,
     ) -> None:
         self.allowed = allowed
@@ -73,6 +74,7 @@ class ToolExecutor:
         self.todo_read = todo_read
         self.team_dispatch = team_dispatch
         self.mcp_dispatch = mcp_dispatch
+        self.permission_checker = permission_checker
         self.log = log
 
     def _tag(self, name: str) -> str:
@@ -93,6 +95,12 @@ class ToolExecutor:
             # 动态 MCP 工具：主 Agent 有 mcp_dispatch 即可，不要求写进静态白名单
             if not (name.startswith("mcp__") and self.mcp_dispatch is not None):
                 return f"Tool not allowed: {name}"
+
+        # 声明式权限（下沉到共享执行器：主 Agent / 子 Agent / 队友统一过闸）
+        if self.permission_checker is not None:
+            msg = self.permission_checker(name, tool_input)
+            if msg is not None:
+                return msg
 
         if self.log:
             print(f"{self._tag(name)}: {brief_tool_input(name, tool_input)}")

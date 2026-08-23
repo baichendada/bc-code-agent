@@ -197,6 +197,7 @@ class AgentTeamManager:
         load_skill: Callable[[str], str],
         web_search: Callable[..., str],
         track_usage: Callable[[Any, str], None] | None = None,
+        permission_checker: Callable[[str, dict], str | None] | None = None,
     ) -> None:
         self.store = store
         self.client = client
@@ -207,6 +208,7 @@ class AgentTeamManager:
         self.load_skill = load_skill
         self.web_search = web_search
         self.track_usage = track_usage
+        self.permission_checker = permission_checker
         self._workers: dict[str, threading.Thread] = {}
         self._stops: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
@@ -510,6 +512,7 @@ class AgentTeamManager:
             load_skill=self.load_skill,
             web_search=self.web_search,
             team_dispatch=team_dispatch,
+            permission_checker=self.permission_checker,
         )
         tools = self._tools_for_member(config)
         messages: list[dict[str, Any]] = [

@@ -140,11 +140,14 @@ class PermissionsConfig:
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[permissions] 无法解析 {config_path}（{exc}），使用内置默认规则")
-            return cls(path=config_path)
+            # 已有配置损坏：宁可启动失败，也不静默降级为宽松内置规则
+            raise PermissionError(
+                f"permissions.json 无法解析（{exc}）。请修复该文件，或删除它以使用内置默认规则。"
+            ) from exc
         if not isinstance(raw, dict):
-            print(f"[permissions] {config_path} 不是对象，使用内置默认规则")
-            return cls(path=config_path)
+            raise PermissionError(
+                "permissions.json 顶层必须是 JSON 对象。请修复该文件，或删除它以使用内置默认规则。"
+            )
 
         default = str(raw.get("default") or "ask").strip().lower()
         if default not in DECISIONS:
