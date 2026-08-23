@@ -699,7 +699,7 @@ Enter a prompt: （输入任意内容即继续）
 
 | 项 | 说明 |
 |---|---|
-| 规则文件 | 项目根 `permissions.json`（与 hooks.json 同层；缺失/坏 JSON 回退内置默认，默认档 ask） |
+| 规则文件 | 项目根 `permissions.json`（与 hooks.json 同层）；文件缺失时用内置默认；**已存在但 JSON 损坏 → 启动失败**（fail-closed） |
 | 规则语法 | `Tool` 精确、`Tool(参数glob)`、`A\|B` 备选、`*` 通配（如 `Shell(git push*\|git commit*)`、`Write(.env*)`、`mcp__*`） |
 | 优先级 | **deny > ask > allow**（档位优先，与规则顺序无关）；同档内第一个命中生效 |
 | default | 未命中规则的兜底档（默认 `ask`） |
@@ -714,7 +714,7 @@ Enter a prompt: （输入任意内容即继续）
 
 决策管道：`permissions.json`（声明式）→ `PreToolUse` hooks（程序式，照旧可 deny/ask/改写输入；仅主 Agent 有 Hook 链）→ 共享执行器执行（子 Agent / 队友在自身 context 内同样过 `permission_gate`）→ `PostToolUse`（审计/截断）。
 
-### 实录（2026-08-23，session=`20260824-003145`）
+### 实录（2026-08-24，sessions=`20260824-010627` 等）
 
 ```text
 Enter a prompt: /permissions
@@ -733,26 +733,22 @@ Shell → ask（规则: Shell(git push*|git commit*)）
 Enter a prompt: /permissions test Shell {"command":"rm -rf /"}
 Shell → deny（规则: Shell(rm -rf*)）
 
-Enter a prompt: 运行 git push origin main 并汇报结果
+Enter a prompt: 运行 git push origin main 并汇报
 [permission] 工具调用 Shell 匹配规则「Shell(git push*|git commit*)」：需要确认
-[permission] 当前不是交互式终端，默认拒绝执行。   ← 非交互 fail-closed
-[Agent]: 主人，这次推送被拦下来了喵～（没有真正执行 push）
+[permission] 参数：command='git push origin main'          ← 展示实际参数
+[permission] 是否继续执行？输入 y 继续，其余取消: （未输 y → 拒绝）
+[Agent]: 主人，推送命令被权限规则拦下了喵～ ……没有收到主人的确认输入，默认拒绝了（fail-closed）
 
 Enter a prompt: 运行 rm -rf / 看看会怎样
-[Agent]: 这个奴家绝对不能执行喵！！（危险 Shell 被 deny，模型拒绝尝试）
+[Agent]: 主人，这个 me 不能执行喵！！（deny：模型拒绝执行并解释原因）
 ```
 
-**子 Agent 与 Task 同样过闸**（临时规则演示：`Shell(echo should*)` deny、`Task(subagent_type=general)` deny）：
+**配置损坏 fail-closed**（把 permissions.json 改成坏 JSON 后启动）：
 
 ```text
-[Task]: subagent_type='general', description='运行指定 echo 命令', ...
-[子·general·Shell]: command='echo should-be-blocked-xyz'
-→ [Permission: 拒绝] 工具调用 Shell 匹配规则「Shell(echo should*)」：已拒绝
-[子 Agent 汇报]: 命令被拦截，未实际执行；不会尝试绕过
-
-（Task 被拒时模型的行为）
-[Task 被规则 Task(subagent_type=general) 拒绝]
-[Agent]: 原计划 Task 委派 general；实际改用主 Agent Shell 直接运行（Task 被权限规则拒绝）
+$ python src/bc_code_agent/start.py
+Traceback ... permissions.PermissionError: permissions.json 无法解析（Expecting ',' delimiter: line 15 column 3）。
+请修复该文件，或删除它以使用内置默认规则。
 ```
 
 **YOLO 模式**（`YOLO=1` 启动）：
@@ -761,6 +757,19 @@ Enter a prompt: 运行 rm -rf / 看看会怎样
 [Permission] YOLO=1：ask 项自动放行，deny 仍生效
 [Permission] YOLO 模式自动放行: 工具调用 Shell 匹配规则「Shell(echo yolo*)」：需要确认
 [Shell]: command='echo yolo-demo' → 执行成功（且已标记 permission_approved，Hook 层不二次询问）
+```
+
+**子 Agent 与 Task 同样过闸**（临时加规则 `Shell(echo should*)` deny、`Task(subagent_type=general)` deny 验证）：
+
+```text
+[Task]: subagent_type='general', description='运行 echo 测试命令', ...
+[子·general·Shell]: command='echo should-be-blocked-xyz'
+→ [Permission: 拒绝] 工具调用 Shell 匹配规则「Shell(echo should*)」：已拒绝
+[子 Agent 汇报]: 命令被拒绝，实际未运行；不会绕过
+
+（Task 被拒时模型的行为）
+[Task 被规则 Task(subagent_type=general) 拒绝]
+[Agent]: 原计划 Task 委派 general；实际改用主 Agent Shell 直接运行（Task 被权限规则拒绝）
 ```
 
 要点：

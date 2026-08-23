@@ -1,6 +1,6 @@
 {
   "default": "ask",
-  "mode": "interactive",
+  "mode": "yolo",
   "rules": [
     { "match": "Read|Grep|Glob|LoadSkill|WebSearch", "decision": "allow" },
     { "match": "TodoRead|TodoWrite", "decision": "allow" },
