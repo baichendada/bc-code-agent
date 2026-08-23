@@ -801,34 +801,51 @@ Traceback ... permissions.PermissionError: permissions.json 无法解析（Expec
 
 实现：`src/bc_code_agent/bg_jobs.py`（BackgroundManager / 跨平台进程组）+ `file_tools.py`（background_shell）+ `start.py`（注入与 /bg）。
 
-### 实录（2026-08-24，session=`20260824-013355`）
+### 实录（2026-08-24，session=`20260824-015421`）
 
-**场景 1：普通对话 —— 完成不唤醒，下轮注入**
+**场景 1：启动 + 列表 + 完成注入（完成不唤醒）**
 
 ```text
-Enter a prompt: 用 Shell(background=true) 启动一个后台任务：sleep 3 后 echo hello-from-bg ...
-[Shell]: command='powershell ... "Start-Sleep -Seconds 3; Write-Output hello-from-bg"'
+Enter a prompt: 帮我用 Shell(background=true) 后台执行一个命令：等待 5 秒后输出 bg-test-done，然后告诉我任务 id
+[Shell]: command='powershell ... "Start-Sleep -Seconds 5; Write-Output bg-test-done"'
 [result]: [Background] 任务 bg_0001 已启动（后台执行中）: powershell ...
-[Agent]: 报告主人～任务 ID bg_0001，约 3 秒后完成，结果会以 [Background] 通知送回来～
+[Agent]: 任务 ID bg_0001...等待 5 秒后输出 bg-test-done；也可用 /bg 查看状态 /bg kill 停掉
 
-Enter a prompt: 看下后台任务的结果
+Enter a prompt: /bg
+id        状态        用时    命令
+bg_0001    completed     5s  powershell ...
+
+Enter a prompt: 看下后台任务怎么样了
 [Background] bg_0001 完成 (exit 0)
   命令: powershell ...
-  输出: hello-from-bg
-[Agent]: 后台任务的结果已经送到啦...
+  输出: bg-test-done
+[Agent]: 后台任务已完成（exit 0）...
 ```
 
-**场景 2：Goal + 长任务 —— defer 等待**
+**场景 2：控制命令（kill 不存在 id 的 fail-safe / clear）**
 
 ```text
-/goal 启动一个约 25 秒的后台任务（sleep 25 后输出 bg-defer-ok），完成后汇报
+Enter a prompt: /bg kill bg_001
+任务不存在: bg_001
+
+Enter a prompt: /bg clear
+[Background] 已清除 1 个已完成任务记录
+
+Enter a prompt: /bg
+没有后台任务
+```
+
+**场景 3：Goal + 长任务 —— defer 等待**
+
+```text
+/goal 启动一个约 20 秒的后台任务（sleep 20 后输出 bg-goal-ok），它完成后汇报结果
 [Goal] 激活: ...
-[Shell] → [Background] 任务 bg_0001 已启动...
+[Shell] → [Background] 任务 bg_0002 已启动...
 [Background] goal 等待后台任务完成...      ← defer：评估器先不评，主循环等待
-[Background] bg_0001 完成 (exit 0)         ← 25s 后完成，通知注入
-  输出: bg-defer-ok
-[Token] goal_eval: in=620 out=44
-[Goal] 达成: 后台任务 bg_0001 启动，25 秒后完成并输出 bg-defer-ok，助手已汇报结果
+[Background] bg_0002 完成 (exit 0)         ← 20s 后完成，通知注入
+  输出: bg-goal-ok
+[Token] goal_eval: in=1234 out=48
+[Goal] 达成: 任务 bg_0002 已后台启动并在 20 秒后完成（exit 0），输出 bg-goal-ok，助手已汇报结果。
 ```
 
 要点：
@@ -838,6 +855,8 @@ Enter a prompt: 看下后台任务的结果
 3. **Goal 内必须等**：goal 语义是“跑完才回”，defer 让后台完成成为续跑触发点（600s 上限防挂死）
 4. **降级兜底**：子 Agent / 队友传 background 会降级同步并提示，不会“启动后没人收结果”
 5. **进程组清理**：kill 命令/进程退出时杀整棵树（Windows taskkill /T），不留孤儿进程
+
+6. **kill 的 fail-safe**：不存在的 / 已结束的任务 id 会明确回报，不会误杀其它任务
 
 ## 后续规划
 
