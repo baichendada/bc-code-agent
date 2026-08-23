@@ -29,6 +29,16 @@ from hooks import (
     confirm_hook_decision,
     load_hooks_from_config,
 )
+from goal import (
+    ACTION_LABELS,
+    CLEAR_ALIASES,
+    DEFAULT_EVALUATOR_MAX_TOKENS,
+    DEFAULT_STOP_HOOK_BLOCK_CAP,
+    MAX_GOAL_LENGTH,
+    GoalController,
+    GoalError,
+    PromptGoalEvaluator,
+)
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +91,15 @@ MODEL = os.getenv("ANTHROPIC_MODEL")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "10000"))
 THINKING_TYPE = os.getenv("THINKING_TYPE", "enabled")
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")
+
+# Goal Loop（Step 14）配置：evaluator 默认同主模型，可换便宜模型
+GOAL_EVALUATOR_MODEL = os.getenv("GOAL_EVALUATOR_MODEL") or MODEL
+GOAL_EVALUATOR_MAX_TOKENS = int(
+    os.getenv("GOAL_EVALUATOR_MAX_TOKENS", str(DEFAULT_EVALUATOR_MAX_TOKENS))
+)
+GOAL_BLOCK_CAP = int(
+    os.getenv("GOAL_BLOCK_CAP", str(DEFAULT_STOP_HOOK_BLOCK_CAP))
+)
 
 if not API_KEY:
     raise SystemExit(f"缺少 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（检查 {ENV_PATH}）")
@@ -193,6 +212,13 @@ Hooks（运行时策略）规则：
 1. 主 Agent 工具调用会经过 before/after hooks（危险 Shell 可 deny；高敏命令 ask；敏感路径 Write 可 deny）。
 2. 若 tool_result 含 [HookDecision: 拒绝/阻止]，不要改路径硬绕过，向主人说明并换安全方案。
 3. Task 子 Agent / 队友暂不走主 Agent 的 Hook 链。
+
+Goal（目标循环）规则：
+1. 主人用 /goal <完成条件> 设定后，本会话会持续工作直到条件满足、判定不可能完成、或连续多次核验失败，不会每轮停下来等主人。
+2. 每轮结束时有一个独立评估器检查对话里的证据；它没有工具，只能看到对话内容，不会替你做验证。
+3. 运行验证命令（如测试、typecheck）后，必须清晰汇报命令与结果（如 exit code、关键输出），让独立评估器能据此判断条件是否满足。
+4. 只有评估器判定通过才算达成；不要自行宣称“完成了”。
+5. 评估未通过时会把你缺失的证据再次发给你，继续工作即可。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -344,8 +370,15 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"WebSearch failed: {type(exc).__name__}: {exc}"
 
 
+_TOTAL_TOKENS = 0
+
+
 def track_usage(message, kind: str) -> None:
+    global _TOTAL_TOKENS
     usage = getattr(message, "usage", None)
+    _TOTAL_TOKENS += int(getattr(usage, "input_tokens", 0) or 0) + int(
+        getattr(usage, "output_tokens", 0) or 0
+    )
     memory.record_usage(
         kind=kind,
         input_tokens=getattr(usage, "input_tokens", None),
@@ -368,6 +401,20 @@ team = AgentTeamManager(
 atexit.register(team.shutdown)
 if team_store.has_active_team():
     team.resume_workers()
+
+goal_controller = GoalController(
+    PromptGoalEvaluator(
+        client=client,
+        model=GOAL_EVALUATOR_MODEL,
+        max_tokens=GOAL_EVALUATOR_MAX_TOKENS,
+        track_usage=track_usage,
+    ),
+    block_cap=GOAL_BLOCK_CAP,
+    state_path=memory.dir / "goal.json",
+)
+_goal_restored = goal_controller.restore()
+if _goal_restored:
+    print(f"[Goal] {_goal_restored}")
 
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
@@ -469,6 +516,37 @@ def run_task_block(block) -> tuple[str, str]:
     return block.id, summary
 
 
+GOAL_RUN = "goal-run"
+
+
+def handle_goal_command(raw: str) -> str | None:
+    """处理 /goal；返回 'goal-run' 表示条件已注入、应进入内层循环。"""
+    line = raw.strip()
+    if not line.lower().startswith("/goal"):
+        return None
+    arg = line[len("/goal"):].strip()
+    if not arg:
+        print(goal_controller.status(_TOTAL_TOKENS) + "\n")
+        return "handled"
+    if arg.lower() in CLEAR_ALIASES:
+        cleared = goal_controller.clear()
+        if cleared:
+            print(f"[Goal] 已清除: {cleared}\n")
+        else:
+            print("[Goal] 当前没有激活的 goal\n")
+        return "handled"
+    if len(arg) > MAX_GOAL_LENGTH:
+        print(f"[Goal] 条件过长（上限 {MAX_GOAL_LENGTH} 字符）\n")
+        return "handled"
+    try:
+        goal_controller.set_goal(arg, tokens_at_start=_TOTAL_TOKENS)
+    except GoalError as exc:
+        print(f"[Goal] {exc}\n")
+        return "handled"
+    print(f"[Goal] 激活: {arg}\n")
+    return GOAL_RUN
+
+
 def handle_slash_command(raw: str) -> bool:
     """处理 /listTeam、/inbox 等本地命令；已处理则返回 True（不进入 LLM）。"""
     line = raw.strip()
@@ -520,10 +598,18 @@ while True:
     if not user_input.strip():
         continue
 
-    if handle_slash_command(user_input):
+    goal_action = handle_goal_command(user_input)
+    if goal_action == "handled":
         continue
 
-    user_msg = {"role": "user", "content": user_input}
+    if goal_action == GOAL_RUN:
+        # /goal <条件>：把条件本身作为本轮用户消息注入，立即开始工作
+        user_msg = {"role": "user", "content": user_input[len("/goal"):].strip()}
+    else:
+        if handle_slash_command(user_input):
+            continue
+        user_msg = {"role": "user", "content": user_input}
+
     history.append(user_msg)
     memory.append_raw(user_msg)
     persist_history()
@@ -590,6 +676,29 @@ while True:
 
         if message.stop_reason != "tool_use":
             reply = next((b.text for b in message.content if b.type == "text"), "")
+
+            if goal_controller.active is not None:
+                decision = goal_controller.evaluate_after_turn(history)
+                if decision.action == "block":
+                    print(f"[Goal] 未达成: {decision.reason}")
+                    reminder = {
+                        "role": "user",
+                        "content": (
+                            "[Goal 仍在进行]\n"
+                            f"条件: {goal_controller.active.condition}\n"
+                            f"评估器: {decision.reason}\n"
+                            "请继续工作，并把缺失的验证证据输出到对话中（例如命令与 exit code）。"
+                        ),
+                    }
+                    history.append(reminder)
+                    memory.append_raw(reminder)
+                    persist_history()
+                    continue
+                label = ACTION_LABELS.get(decision.action, decision.action)
+                print(f"[Goal] {label}: {decision.reason}")
+                print(f"[Agent]: {reply}\n")
+                break
+
             stop_ctx = {
                 "reply": reply,
                 "history": history,

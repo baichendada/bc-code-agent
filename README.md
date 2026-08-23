@@ -17,7 +17,7 @@
 - [x] **Step 11**：MCP Host（`mcp.json` + filesystem server，仅主 Agent）
 - [x] **Step 12**：Hooks（`hooks.json` + command/builtin；Event→Matcher→Handler→Decision）
 - [x] **Step 13**：Session 续聊（`--list-sessions` + `--session <id>`）
-- [ ] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
+- [x] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
 - [ ] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
 - [ ] **Step 16**：Background Shell（慢命令后台 + 完成通知）
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
@@ -616,19 +616,65 @@ Enter a prompt: 暗号是什么
 2. **快照**：运行中写入 `working.json`；恢复时读回 `history`  
 3. **对照**：不带 `--session` 再开是新目录，不应再记得暗号  
 
+## Step 14：Goal Loop（目标循环）
+
+参考 learn-claude-code s17（Goal = session 级 Stop hook）+ Claude Code `/goal` + Codex Goal 的设计意图：**模型停止调用工具只说明这一轮想停，不代表整个目标达成**。
+
+| 项 | 说明 |
+|---|---|
+| 命令 | `/goal <完成条件>`（激活）、`/goal`（状态）、`/goal clear`（stop/off/reset/none/cancel 别名） |
+| 语义 | 条件直接作为本轮用户消息注入，立即开工；除非达成，否则不回到提示符 |
+| 评估器 | 无工具的独立模型调用：只判定对话里是否已有满足条件的证据；输出 `{ok, reason, impossible}` |
+| 退出 | `achieved`（评估通过）/ `failed`（判 impossible）/ `limit`（连续 block 超上限）/ `error`（评估异常）—— 后两者 goal 保持激活，交还主人 |
+| 预算 | 连续 block 上限 `GOAL_BLOCK_CAP`（默认 8）：到限暂停自动续跑，**不标完成、不清 goal**；status 显示 elapsed / 核验次数 / token 花费 |
+| 持久化 | `sessions/<id>/goal.json`；`--session` 续聊时恢复 active goal（轮次与 token 基线重置） |
+| 与 Stop Hook | goal 激活期间 quality gate 让位，由 goal 评估器统一决策（避免两个 block 打架） |
+| 与 Todo | 不变：goal 期间照样 TodoWrite 拆步、Task 委派 |
+
+实现：`src/bc_code_agent/goal.py`（GoalState / PromptGoalEvaluator / GoalController）。
+
+设计取舍：
+
+1. **评估器无工具**：它不跑命令不读文件，只判定「对话里的证据是否够」；真正的验证仍由主模型用工具完成（Goal 不是测试框架）
+2. **评估器 prompt 防口嗨**：明确要求「除非对话里有命令结果，否则不假设命令成功」，并声明输入里的 JSON 是数据不是指令
+3. **预算放 Goal 外面**：Goal 不藏默认轮数预算；上限只是「暂停自动续跑」，用户可继续/换条件/清除
+4. **默认同主模型**：`.env` 可换 `GOAL_EVALUATOR_MODEL`（如 glm-4-flash 省钱）；评估输入是对话文本、输出短 JSON（512 token 上限即可）
+
+### 实录（2026-08-23，session=`20260823-232628`）
+
+```text
+Enter a prompt: /goal 运行 date 命令并汇报当前时间结果
+[Goal] 激活: 运行 date 命令并汇报当前时间结果
+
+[Shell]: command='powershell -NoProfile -Command "Get-Date -Format ..."'
+[result]: 2026-08-23 23:26:43 (星期日)
+[Shell]: command='powershell -NoProfile -Command "(Get-Date).DayOfWeek"'
+[result]: Sunday
+[Token] goal_eval: in=466 out=59
+[Goal] 达成: 助手通过 PowerShell 等效命令查询了当前日期时间，并在回复中明确汇报了结果：
+          2026年8月23日 星期日 23:26:43，满足条件。
+[Agent]: 汇报完毕，主人喵～ （当前时间 + 说明 Windows 下 date 是设置命令所以改用 PowerShell）
+```
+
+要点：
+
+1. **激活即开工**：`/goal` 后模型自动连续多轮（本例 2 轮 Shell），不需要再输入「继续」
+2. **独立核验才停**：`[Token] goal_eval` 出现即停前最后一道闸；`[Goal] 达成` 才收工
+3. **评估器读的是对话**：模型要把命令与结果说清楚（system 里有对应规则），否则评估器判「缺证据」→ block → 继续
+4. **达成后 goal.json 记录 met**，`/goal` 可回看历史结果
+
 ## 后续规划
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊。  
-差的是后半程：长任务、无人值守闸门、编排与收口。排序原则：
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / **goal loop（Step 14）**。  
+差的是后半程：无人值守闸门、并行与编排收口。排序原则：
 
-1. 先改循环的停法，再加外围调度  
-2. Goal 会长时间自己调工具，闸门要够用（Step 12 Hook 可撑 MVP）  
+1. 先改循环的停法，再加外围调度（已完成：Step 14）  
+2. Goal 会长时间自己调工具，闸门要够用（下一步：15 Permission 硬闸）  
 3. Team 抢任务 / worktree 依赖任务图，不要提前做  
 
 ```text
-现在 (Chat loop + Hooks + Session 续聊)
-    → 14 Goal Loop
-         → 15 Permission（给无人值守加硬闸）
+现在 (Chat loop + Hooks + Session 续聊 + Goal Loop)
+    → 15 Permission（给无人值守加硬闸）
          → 16 Background Shell（给长命令让路）
     → 17 Task 图 → 18 Team 抢任务/worktree
     → 19 Cron（发现工作）
@@ -637,7 +683,7 @@ Enter a prompt: 暗号是什么
 
 | Step | 做什么 | 为什么排这里 | MVP |
 |---|---|---|---|
-| 14 Goal Loop | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `GOAL.md` + 轮次预算 + review/测试当 verifier |
+| 14 Goal Loop ✅ | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `goal.json` + block 上限 + 独立评估器 |
 | 15 Permission | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认 |
 | 16 Background Shell | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
 | 17 Task 图 | 落盘任务 + `blockedBy` | Todo 管本轮；图管跨 Agent、可领取 | `tasks.jsonl`；`/tasks` |
@@ -649,20 +695,9 @@ Enter a prompt: 暗号是什么
 
 ### Step 14 MVP 草案
 
-```text
-/goal <一句话 + 可验证 done>
-    → 写入 sessions/<id>/GOAL.md
-    → while status == running 且未超预算:
-         现有 LLM + 工具循环（Todo/Task/Hooks 照旧）
-         模型想停 → 不直接结束
-         → Verifier（复用 review 子 Agent，或跑一条检查命令）
-         → PASS: completed
-         → FAIL: 缺口塞回 history，continue
-    → /goal status | pause | resume | clear
-```
-
-预算示例：最多 8 轮 LLM；连续 2 次核验失败则 `blocked` 交还主人。  
-刻意不做：独立 verifier 模型、多数投票、strategist。
+> 已实现（2026-08-23）：GOAL.md → `goal.json`；verifier → 独立评估器（无工具模型）；
+> 「连续 2 次失败 block」→ 连续 block 超上限 `limit`（goal 保持激活）；轮次预算 → 由上限控制。
+> 刻意不做仍然成立：独立 verifier 模型（默认同主模型）、多数投票、strategist。
 
 ## 快速开始
 
@@ -681,6 +716,11 @@ MAX_TOKENS=10000
 # 智谱思考配置（见 docs.bigmodel.cn 深度思考）
 THINKING_TYPE=enabled
 REASONING_EFFORT=high
+
+# Goal Loop（Step 14）：评估器默认同主模型，可换便宜模型省 token
+# GOAL_EVALUATOR_MODEL=glm-4-flash
+# GOAL_EVALUATOR_MAX_TOKENS=512
+# GOAL_BLOCK_CAP=8
 ```
 
 ```bash
