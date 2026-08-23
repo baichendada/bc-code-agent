@@ -789,6 +789,7 @@ Traceback ... permissions.PermissionError: permissions.json 无法解析（Expec
 | 项 | 说明 |
 |---|---|
 | 触发 | `Shell(background=true)`（显式参数，不猜“install/test”等关键词）；系统提示词要求“仅独立、不阻塞后续步骤的命令用后台” |
+| 超时 | 默认 **1800s**（`BG_TIMEOUT` env 可改，0=不设内部超时）；goal 等待无上限（任务超时/失败后等待自然结束） |
 | 生命周期 | 登记 `bg_0001` 递增 → daemon 线程执行（独立进程组）→ 立即返回占位结果 → 完成进队列（collect 消费即清空） |
 | 通知 | 不重建 tool_use_id：完成消息是独立事件（`[Background] bg_0001 完成 (exit 0)` + 命令 + 输出摘要 2000 字符） |
 | 注入时机 | 每轮 LLM 调用前 `inject_background()`：合并到最后一条 user 消息或新开一条（**完成不唤醒**，普通对话等你下次输入时才带上） |

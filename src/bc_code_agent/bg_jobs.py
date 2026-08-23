@@ -18,9 +18,24 @@ import time
 from pathlib import Path
 from typing import Any
 
-BG_TIMEOUT = 120          # 后台任务超时（秒）
+BG_TIMEOUT_ENV = "BG_TIMEOUT"  # 环境变量可覆盖默认超时（秒；0/空 = 不设内部超时）
+BG_TIMEOUT_DEFAULT = 1800.0    # 默认 30 分钟：覆盖完整测试套件/安装的长命令
 BG_NOTIFY_CHARS = 2000    # 通知里输出的摘要素数
 MAX_TASK_HISTORY = 200    # tasks dict 上限（防无限累积）
+
+
+def default_timeout() -> float | None:
+    """后台任务默认超时：BG_TIMEOUT env 优先；0 或非数值 → 不设内部超时。
+    超时只用于“任务卡死自动报告”，kill/会话退出仍可随时终止。"""
+    raw = os.getenv(BG_TIMEOUT_ENV, "").strip()
+    if raw == "":
+        return BG_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[Background] 无效的 {BG_TIMEOUT_ENV}={raw!r}，使用默认 {BG_TIMEOUT_DEFAULT:.0f}s")
+        return BG_TIMEOUT_DEFAULT
+    return None if value <= 0 else value
 
 
 def _spawn(command: str, cwd: Path) -> subprocess.Popen:
@@ -69,8 +84,8 @@ def _kill_process(proc: subprocess.Popen) -> None:
 class BackgroundManager:
     """任务登记 + daemon 执行 + 完成队列 + 进程组清理。"""
 
-    def __init__(self, timeout: float = BG_TIMEOUT) -> None:
-        self.timeout = timeout
+    def __init__(self, timeout: float | None = None) -> None:
+        self.timeout = default_timeout() if timeout is None else timeout
         self.tasks: dict[str, dict[str, Any]] = {}
         self.results: dict[str, str] = {}
         self._ready: list[str] = []
@@ -84,6 +99,7 @@ class BackgroundManager:
         command = (command or "").strip()
         if not command:
             raise ValueError("background command cannot be empty")
+        task_timeout: float | None = self.timeout
 
         with self._lock:
             self._counter += 1
@@ -94,6 +110,7 @@ class BackgroundManager:
                 "started_at": time.time(),
                 "exit_code": None,
             }
+
         try:
             proc = _spawn(command, cwd or Path.cwd())
         except OSError as exc:
@@ -107,16 +124,21 @@ class BackgroundManager:
 
         thread = threading.Thread(
             target=self._run,
-            args=(task_id, proc),
+            args=(task_id, proc, task_timeout),
             daemon=True,
             name=f"bg-{task_id}",
         )
         thread.start()
         return task_id
 
-    def _run(self, task_id: str, proc: subprocess.Popen) -> None:
+    def _run(
+        self, task_id: str, proc: subprocess.Popen, task_timeout: float | None
+    ) -> None:
         try:
-            stdout, stderr = proc.communicate(timeout=self.timeout)
+            if task_timeout is None:
+                stdout, stderr = proc.communicate()
+            else:
+                stdout, stderr = proc.communicate(timeout=task_timeout)
             output = (stdout or "") + (stderr or "")
             output = output.strip() or "(no output)"
             exit_code = proc.returncode
@@ -127,7 +149,7 @@ class BackgroundManager:
                 else f"Error: command exited with status {exit_code}\n{output}"
             )
         except subprocess.TimeoutExpired:
-            result = f"Error: timeout after {int(self.timeout)}s"
+            result = f"Error: timeout after {int(task_timeout)}s"
             status = "failed"
             exit_code = None
         except OSError as exc:

@@ -651,14 +651,11 @@ def inject_background(history: list[dict]) -> int:
     return len(notifications)
 
 
-def wait_background(manager, timeout: float = 600.0) -> bool:
-    """Goal defer 后等待后台任务完成；超时返回 False。"""
-    waited = 0.0
+def wait_background(manager) -> bool:
+    """Goal defer 后等待后台任务完成。
+    任务超时/失败都会让 running() 归 0，等待自然结束，不会无限挂等。"""
     while manager.running() > 0:
-        if waited >= timeout:
-            return False
         time.sleep(1.0)
-        waited += 1.0
     return True
 
 
@@ -854,11 +851,8 @@ while True:
                 if decision.action == "defer":
                     # 后台任务仍在跑：等它完成（collect 后有通知，下一轮注入）
                     print("[Background] goal 等待后台任务完成...")
-                    if wait_background(BACKGROUND):
-                        continue
-                    print("[Background] 等待超时（600s），任务仍在运行；本轮交还主人")
-                    print(f"[Agent]: {reply}\n")
-                    break
+                    wait_background(BACKGROUND)
+                    continue
                 if decision.action == "block":
                     print(f"[Goal] 未达成: {decision.reason}")
                     reminder = {
