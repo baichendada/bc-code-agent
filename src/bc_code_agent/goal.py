@@ -1,6 +1,6 @@
 """Goal Loop（Step 14）：模型提议停止，独立评估器决定是否真正收工。
 
-参照 learn-claude-code s17_goal_loop 裁剪适配：
+设计要点：
 - Goal 是 session 级 Stop hook：无 goal 时行为与从前完全一致；
 - evaluator 是无工具的独立模型调用，只判定对话中已有的证据（不自己跑命令）；
 - 预算放在 goal 外面（连续 block 上限），到限不停标完成、不清 goal，交还用户；

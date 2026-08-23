@@ -618,7 +618,7 @@ Enter a prompt: 暗号是什么
 
 ## Step 14：Goal Loop（目标循环）
 
-参考 learn-claude-code s17（Goal = session 级 Stop hook）+ Claude Code `/goal` + Codex Goal 的设计意图：**模型停止调用工具只说明这一轮想停，不代表整个目标达成**。
+核心观点：**模型停止调用工具只说明这一轮想停，不代表整个目标达成**。
 
 | 项 | 说明 |
 |---|---|
