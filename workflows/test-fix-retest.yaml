@@ -28,7 +28,7 @@ steps:
     label: 修复第 1 轮
     prompt: |
       根据以下诊断修复代码（不要改 tests/ 下的测试文件）：
-      {args.diagnosis}
+      {steps.diagnose-1.value}
       只返回 JSON 对象：{"summary": string, "changed_files": [string]}
     schema:
       type: object
@@ -62,7 +62,7 @@ steps:
     label: 修复第 2 轮
     prompt: |
       上一轮修复后测试仍失败。根据诊断再次修复（不要改 tests/ 下的测试文件）：
-      {args.diagnosis}
+      {steps.diagnose-2.value}
       只返回 JSON 对象：{"summary": string, "changed_files": [string]}
     schema:
       type: object

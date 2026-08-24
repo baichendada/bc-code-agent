@@ -953,9 +953,10 @@ c_0004    */1 * * * *          运行    运行 git push origin main 并汇报�
 |---|---|
 | 注册 | `workflows/*.yaml`（YAML，需 pyyaml）：name（slug）/ description / phases / steps；坏文件跳过并告警 |
 | Step 类型 | `command`（本地命令）/ `agent`（子 Agent，profile+prompt）/ `parallel`（多 agent 并发 barrier）/ `pipeline`（items × stages，每 item 独立走完） |
-| 条件 | `run_if: always \| prev_failed \| prev_succeeded \| <step_id>.failed \| <step_id>.succeeded`（引用任此前置步骤；跳过不污染 prev 状态） |
+| 条件 | `run_if: always \| prev_failed \| prev_succeeded \| <step_id>.failed \| <step_id>.succeeded`（引用任此前置步骤；跳过不污染 prev 状态）；**skipped 不计入失败**（全通过场景 = completed） |
 | 结构化输出 | agent step 可选 `schema`：简版校验（type/required/properties），失败重试一次，仍失败 → 该步骤 failed |
-| 安全 | `Workflow` 工具本身权限 ask；**command 步骤逐条过同一道闸**（危险命令黑名单 + permission_gate：deny/ask/yolo/scheduled 全部生效） |
+| 安全 | `Workflow` 工具本身权限 ask；**command 步骤与模型 Shell 同链**（危险黑名单 → permission_gate → PreToolUse Hook，含高敏 ask，全链路生效） |
+| 数据流 | prompt 支持 `{args.key}` 与 **`{steps.<id>.value\|output}`**（前序步骤结果注入，如诊断 → 修复） |
 | journal | `sessions/<id>/workflows/<runId>/`：快照 json + `<runId>.journal.jsonl`（每步 {key, value} 审计记录）+ 排他锁（O_EXCL） |
 | 语义 | **本版不做断点续跑**：journal 只作审计（`/workflow status` 看每步状态）；失败后重跑 = 全新执行（失败步骤可反复重试） |
 | 命令/工具 | `/workflow`（list）/ `/workflow status <runId>`；工具 `Workflow`（name/args） |

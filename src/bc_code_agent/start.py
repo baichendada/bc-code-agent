@@ -584,7 +584,8 @@ def lead_cron_dispatch(name: str, tool_input: dict) -> str:
 
 
 def workflow_command_guard(name: str, tool_input: dict) -> str | None:
-    """command 步骤的闸：黑名单兜底 → 权限管道（返回非 None = 拒绝消息）。"""
+    """command 步骤的闸（与模型 Shell 同链）：黑名单 → 权限管道 → PreToolUse Hook。
+    任一环节拒绝即拦截（scheduled 轮中 Hook ask 同样不弹窗）。"""
     command = str(tool_input.get("command") or "")
     from security import match_shell_command
 
@@ -592,8 +593,25 @@ def workflow_command_guard(name: str, tool_input: dict) -> str | None:
     if hit:
         pattern, description = hit
         return f"Security: 危险命令已拦截：{description}（匹配模式：{pattern}）"
-    blocked, _approved = permission_gate("Shell", tool_input)
-    return blocked
+    blocked, approved = permission_gate("Shell", tool_input)
+    if blocked is not None:
+        return blocked
+
+    ctx: dict = {"name": "Shell", "input": tool_input}
+    if approved:
+        ctx["permission_approved"] = True
+    decision = HOOKS.emit("before_tool_call", ctx, tool_matcher="Shell")
+    if isinstance(decision, HookDecision):
+        if decision.is_blocking:
+            return decision.to_message()
+        if decision.action == "ask":
+            if is_scheduled_turn():
+                return f"[Permission: 拒绝] 定时任务中未确认：{decision.reason}"
+            if not confirm_hook_decision(decision):
+                return f"[Permission: 拒绝] 用户未确认：{decision.reason}"
+    elif isinstance(decision, str):
+        return decision
+    return None
 
 
 workflow_registry = WorkflowRegistry(ROOT / "workflows")

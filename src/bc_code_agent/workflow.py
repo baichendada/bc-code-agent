@@ -244,13 +244,30 @@ def _run_if_met(run_if: str, results: dict[str, Any], prev_status: str) -> bool:
     return record.get("status") == status
 
 
-def _render(text: str, args: dict[str, Any]) -> str:
-    """{args.key} 简单模板替换（不引入 format 的花括号语义）。"""
+def _render(text: str, args: dict[str, Any], results: dict[str, Any]) -> str:
+    """模板替换：{args.key}（初始参数）+ {steps.<id>.value|output}（前序步骤结果）。"""
 
     def repl(match: re.Match[str]) -> str:
-        return str(args.get(match.group(1), match.group(0)))
+        full = match.group(0)
+        step_id = match.group(2)
+        if step_id is not None:  # {steps.<id>.value|output}
+            field = match.group(3)
+            record = results.get(step_id)
+            if record is None:
+                return full
+            value = record.get("value")
+            if field == "output" and isinstance(value, dict):
+                return str(value.get("output", ""))
+            if isinstance(value, dict):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+        return str(args.get(match.group(1), full))
 
-    return re.sub(r"\{args\.([A-Za-z0-9_]+)\}", repl, text)
+    return re.sub(
+        r"\{args\.([A-Za-z0-9_]+)\}|\{steps\.([A-Za-z0-9_-]+)\.(value|output)\}",
+        repl,
+        text,
+    )
 
 
 class WorkflowRunner:
@@ -305,7 +322,12 @@ class WorkflowRuntime:
             raise WorkflowError(f"snapshot 引用的 workflow 不存在: {snapshot['name']}")
         args = snapshot.get("args") or {}
         journal = WorkflowJournal(self._run_dir(run_id) / f"{run_id}.journal.jsonl")
+        with self._lock:
+            return self._run_locked(run_id, snapshot, workflow, args, journal)
 
+    def _run_locked(self, run_id: str, snapshot: dict[str, Any],
+                    workflow: dict[str, Any], args: dict[str, Any],
+                    journal: WorkflowJournal) -> dict[str, Any]:
         prev_status = "succeeded"  # 初始无前置（当作成功）
         results: dict[str, Any] = {}
         for step in workflow.get("steps") or []:
@@ -321,7 +343,7 @@ class WorkflowRuntime:
             key = _step_key(str(snapshot["name"]), step)
             start = time.perf_counter()
             try:
-                value = self._execute_step(workflow, step, args)
+                value = self._execute_step(workflow, step, args, results)
                 status = "succeeded" if not _step_failed(value) else "failed"
                 record = {"status": status, "value": value,
                           "duration_ms": int((time.perf_counter() - start) * 1000)}
@@ -334,7 +356,7 @@ class WorkflowRuntime:
             prev_status = str(record.get("status", "succeeded"))
 
         status = "completed" if all(
-            r.get("status") == "succeeded" for r in results.values()
+            r.get("status") != "failed" for r in results.values()
         ) else "failed"
         self._write_snapshot(run_id, workflow, args, status=status, results=results)
         print(f"[Workflow] {run_id}: {status}")
@@ -342,16 +364,17 @@ class WorkflowRuntime:
 
     # ---------- 步骤执行 ----------
 
-    def _execute_step(self, workflow: dict[str, Any], step: dict[str, Any], args: dict[str, Any]) -> Any:
+    def _execute_step(self, workflow: dict[str, Any], step: dict[str, Any],
+                      args: dict[str, Any], results: dict[str, Any]) -> Any:
         step_type = step["type"]
         if step_type == "command":
             return self._execute_command(step)
         if step_type == "agent":
-            return self._execute_agent(step, args)
+            return self._execute_agent(step, args, results)
         if step_type == "parallel":
-            return self._execute_parallel(step, args)
+            return self._execute_parallel(step, args, results)
         if step_type == "pipeline":
-            return self._execute_pipeline(step, args)
+            return self._execute_pipeline(step, args, results)
         raise WorkflowError(f"未知 step 类型: {step_type}")
 
     def _execute_command(self, step: dict[str, Any]) -> dict[str, Any]:
@@ -375,8 +398,9 @@ class WorkflowRuntime:
         output = (proc.stdout or "") + (proc.stderr or "")
         return {"exit_code": proc.returncode, "output": output.strip()[:20000]}
 
-    def _execute_agent(self, step: dict[str, Any], args: dict[str, Any]) -> Any:
-        prompt = _render(str(step["prompt"]), args)
+    def _execute_agent(self, step: dict[str, Any], args: dict[str, Any],
+                       results: dict[str, Any]) -> Any:
+        prompt = _render(str(step["prompt"]), args, results)
         schema = step.get("schema") if isinstance(step.get("schema"), dict) else None
         value = self.runner.run_agent(
             str(step.get("profile", "general")),
@@ -389,15 +413,18 @@ class WorkflowRuntime:
             raise WorkflowError(value)
         return value
 
-    def _execute_parallel(self, step: dict[str, Any], args: dict[str, Any]) -> list[Any]:
+    def _execute_parallel(self, step: dict[str, Any], args: dict[str, Any],
+                          results: dict[str, Any]) -> list[Any]:
         agents = step.get("agents") or []
         with ThreadPoolExecutor(max_workers=max(1, len(agents))) as pool:
             futures = [
-                pool.submit(self._execute_agent, agent, args) for agent in agents
+                pool.submit(self._execute_agent, agent, args, results)
+                for agent in agents
             ]
             return [future.result() for future in futures]
 
-    def _execute_pipeline(self, step: dict[str, Any], args: dict[str, Any]) -> list[Any]:
+    def _execute_pipeline(self, step: dict[str, Any], args: dict[str, Any],
+                          results: dict[str, Any]) -> list[Any]:
         items = step.get("items") or []
         stages = step.get("stages") or []
 
@@ -406,7 +433,9 @@ class WorkflowRuntime:
             value = item
             for stage in stages:
                 value = self._execute_agent(
-                    stage, dict(args, item=value, item_index=idx)
+                    stage,
+                    dict(args, item=value, item_index=idx),
+                    results,
                 )
             return value
 
@@ -425,7 +454,10 @@ class WorkflowRuntime:
         if results is not None:
             data["results"] = results
         path = self._run_dir(run_id) / f"{run_id}.json"
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
 
     def _read_snapshot(self, run_id: str) -> dict[str, Any] | None:
         path = self._run_dir(run_id) / f"{run_id}.json"
