@@ -14,7 +14,7 @@
 | 安全与闸门 | 权限管道（deny>ask>allow）/ Hooks 策略链 / 危险命令黑名单 / YOLO 可配 |
 | 协作与委派 | Task 子 Agent（4 个 profile）/ AgentTeam（mailbox + 消息工具） |
 | 异步与调度 | 后台任务（完成注入）/ Cron 定时轮 / Workflow 固定编排（parallel/pipeline） |
-| 教学形态 | 每步独立实录（真实会话）/ [`guide/`](guide/README.md) 20 步教程 / 178 项测试 |
+| 教学形态 | 每步独立实录（真实会话）/ [`guide/`](guide/README.md) 18 章可运行教程（17/18 暂缓）/ 178 项测试 |
 
 **设计主线**：所有的"停"都要核验（Goal）、所有的"动"都要过闸（Permission + Hook）、所有"长事"都可恢复可观察（记忆 / journal / 状态落盘）。
 
@@ -41,6 +41,34 @@ python src/bc_code_agent/start.py
 - [x] **Step 19**：Cron（到点触发，三线程模型） — [详情](docs/steps/step-19.md)
 - [x] **Step 20**：Workflow Runtime（YAML 固定编排 + journal 审计） — [详情](docs/steps/step-20.md)
 
+## Guide：从零实现终端 Agent
+
+[`guide/README.md`](guide/README.md) 是一条按学习曲线重排的从零教程：Step 01–16、19–20 共 18 章已完成；Step 17/18（Task 图、Team v2）作为多执行者进阶主题暂缓。
+
+每章都包含：
+
+- 固定讲解结构：问题 → 解决方案 → 图示 → 工作原理 → 试一下 → 常见坑 → 接下来
+- Mermaid 图示，标出机制在 Agent loop 中的位置
+- 最小离线 `agent.py`，不要求 API Key 即可运行教学演示
+- `--check` 自检，覆盖当章核心行为与边界
+
+逐章运行自检（PowerShell）：
+
+```powershell
+foreach ($agent in Get-ChildItem guide/step-*/agent.py | Sort-Object FullName) {
+  py -3.13 $agent.FullName --check
+}
+```
+
+也可以直接进入单章，例如：
+
+```bash
+python guide/step-05-tool-loop/agent.py
+python guide/step-05-tool-loop/agent.py --check
+```
+
+Step 01 额外提供 `--real`，用于把离线 fake stream 换成真实 Anthropic Messages API。
+
 ## 目录结构
 
 ```
@@ -64,7 +92,7 @@ skills/            Skill 目录（渐进式披露）
 sessions/          会话落盘（gitignore）
 tests/             本地测试（gitignore，178 项）
 docs/              每步详解 + 索引
-guide/             从零写终端 Agent 的 20 步教程
+guide/             从零写终端 Agent 的教程（18 章已完成，17/18 暂缓）
 ```
 
 ## 常用命令速查
