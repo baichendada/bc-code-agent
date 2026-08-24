@@ -8,9 +8,13 @@
 
 ```text
 $ python guide/step-01-hello-agent/agent.py
-你好！我是一个运行在终端里的语言模型，可以回答问题、解释概念、陪你聊天。
-在接下来的章节里，我会慢慢长出记忆、工具和自主行动的能力。
+我是由Z.ai训练的大型语言模型，也就是你们常说的AI助手。
+我可以回答你的问题、帮你写东西、翻译语言，也可以和你一起头脑风暴、出谋划策。
+
+今天你想聊点什么呢？
 ```
+
+（这是本教程实跑的输出，逐字打出；你那边的内容会略有不同。）
 
 这是 Agent 的"受精卵"：还没有循环、没有记忆、没有工具、没有人设，但它已经具备 Agent 最重要的两件事——
 
@@ -101,7 +105,7 @@ def ask(prompt: str) -> str:
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
-        for text in stream.text_deltas:
+        for text in stream.text_stream:
             print(text, end="", flush=True)
             chunks.append(text)
     print()
