@@ -406,7 +406,9 @@ class WorkflowRuntime:
             str(step.get("profile", "general")),
             prompt,
             schema,
-            str(step.get("label", step["id"])),
+            # 注意：parallel 子 agent / pipeline stage 没有 id 字段，
+            # 默认参数会先求值，不能写 step.get("label", step["id"])
+            str(step.get("label") or step.get("id") or "agent"),
         )
         # schema 路径返回字符串 = 结构化输出失败（JSON/校验）→ 视为步骤失败
         if schema is not None and isinstance(value, str):

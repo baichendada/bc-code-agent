@@ -989,6 +989,28 @@ test-fix-retest      运行项目测试；失败则 review 定位 → general �
 journal: 每步一行 {key, value}（含失败记录）
 ```
 
+**交互实测（2026-08-25，session=`20260825-024410`；review-changes 完整链路）：**
+
+```text
+Enter a prompt: 请用 Workflow 工具执行 review-changes，将以下代码作为 args.changes 传入...
+[permission] 工具调用 Workflow 匹配规则「Workflow」：需要确认
+[permission] 是否继续执行？输入 y 继续，其余取消: y
+[Workflow]: {'name': 'review-changes', 'args': {'changes': 'def get_user(name): ...'}}
+[Workflow] audit-dimensions: 执行中...
+[Workflow] agent(安全审计) profile=review      ┐
+[Workflow] agent(性能审计) profile=review      ├─ 3 个 review 子 Agent 并发（各自独立 context）
+[Workflow] agent(正确性审计) profile=review    ┘
+[Workflow] verify-pipeline: 执行中...
+[Workflow] agent(复核) profile=review ×3        ← security/performance/correctness 各复核一次
+[Workflow] review-changes-...-95761: completed
+[result]: audit-dimensions: succeeded / verify-pipeline: succeeded
+[Agent]: 汇报真实审计结论（SQL 注入 Critical + 无锁并发竞态 High，两处分别命中二维度）
+```
+
+> 注：parallel 子 agent 与 pipeline stage 没有独立 id 字段，label 回退曾因
+> `step.get("label", step["id"])` 默认参数先求值而 KeyError —— 已修复为
+> `step.get("label") or step.get("id") or "agent"`（加上 parallel/pipeline 真实执行测试）。
+
 要点：
 
 1. **编排进配置，模型只选**：命令清单写在 yaml（人审）；模型不能注入可执行代码
