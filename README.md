@@ -23,7 +23,7 @@
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
 - [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
 - [x] **Step 19**：Cron（到点触发）
-- [x] **Step 20**：Workflow Runtime（固定编排脚本 + journal 可 resume）
+- [x] **Step 20**：Workflow Runtime（固定编排脚本 + journal 审计）
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
 
@@ -956,10 +956,10 @@ c_0004    */1 * * * *          运行    运行 git push origin main 并汇报�
 | 条件 | `run_if: always \| prev_failed \| prev_succeeded \| <step_id>.failed \| <step_id>.succeeded`（引用任此前置步骤；跳过不污染 prev 状态） |
 | 结构化输出 | agent step 可选 `schema`：简版校验（type/required/properties），失败重试一次，仍失败 → 该步骤 failed |
 | 安全 | `Workflow` 工具本身权限 ask；**command 步骤逐条过同一道闸**（危险命令黑名单 + permission_gate：deny/ask/yolo/scheduled 全部生效） |
-| journal | `sessions/<id>/workflows/<runId>/`：快照 json + `<runId>.journal.jsonl`（每步 {key, value}）+ 排他锁（O_EXCL） |
-| resume | `resume_from_run_id`：按步骤定义语义 key 命中缓存（**只复用 succeeded/skipped**；failed 步骤重跑，失败可重试） |
-| 命令/工具 | `/workflow`（list）/ `/workflow status <runId>`；工具 `Workflow`（name/args/resume_from_run_id） |
-| 边界 | run 目录在 session 下：`--session` 恢复同一 session 才能 resume（新 session 看不到旧 run） |
+| journal | `sessions/<id>/workflows/<runId>/`：快照 json + `<runId>.journal.jsonl`（每步 {key, value} 审计记录）+ 排他锁（O_EXCL） |
+| 语义 | **本版不做断点续跑**：journal 只作审计（`/workflow status` 看每步状态）；失败后重跑 = 全新执行（失败步骤可反复重试） |
+| 命令/工具 | `/workflow`（list）/ `/workflow status <runId>`；工具 `Workflow`（name/args） |
+| 边界 | run 目录在 session 下：`--session` 恢复同一 session 可看历史 run；本版不做断点续跑 |
 
 实现：`src/bc_code_agent/workflow.py`（registry / schema 校验 / journal / runtime）+ 示例 `workflows/test-fix-retest.yaml`、`workflows/review-changes.yaml`。
 
@@ -993,8 +993,13 @@ journal: 每步一行 {key, value}（含失败记录）
 1. **编排进配置，模型只选**：命令清单写在 yaml（人审）；模型不能注入可执行代码
 2. **安全不绕行**：command 步骤与模型 Shell 同一道闸（黑名单 + permission_gate）；agent 子步骤走子 Agent 通道（权限照常）
 3. **条件引用前置步骤**：`test-1.failed` 表达“测试失败后的分支”，而不是只看紧邻上一步（否则 诊断成功 → 修复被跳过）
-4. **失败可重试**：resume 只复用成功；失败步骤重新执行（瞬时 API/命令失败可续跑）
-5. **schema 失败即步骤失败**：结构化输出不合规不会混进 completed（坏结果不入 journal 复用）
+4. **失败可重试**：重跑同一 workflow 是全新执行（journal 只审计）；失败步骤不会被“缓存命中”永久卡住
+5. **schema 失败即步骤失败**：结构化输出不合规不会混进 completed（坏结果不入审计）
+
+### 已知边界与后续
+
+- 本版**无断点续跑**（resume）：journal 是审计记录不是缓存；跨进程/跨 session 恢复留作将来扩展
+- 可能的下一步：模型生成 workflow 脚本（Workflow generate + 确认后入库 = 业界 dynamic workflows 路线）
 
 ## 后续规划
 

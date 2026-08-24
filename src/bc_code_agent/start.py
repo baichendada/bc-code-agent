@@ -251,8 +251,8 @@ Cron（定时任务）规则：
 Workflow（固定编排）规则：
 1. 固定路径的任务（如 测试→修复→复测、多维度审查）用 Workflow 工具执行，编排在 workflows/*.yaml 注册（本人只需给 name/args）。
 2. agent 步骤可能返回结构化 JSON（schema）——按结构处理，不要忽略字段。
-3. 运行失败可带 resume_from_run_id 续跑（未变化的步骤复用 journal 缓存，不重跑）。
-4. 用 /workflow list 看注册表；/workflow status <runId> 看运行状态。
+3. 运行完成后可 /workflow status <runId> 查看每步状态（journal 审计）。
+4. 用 /workflow list 看注册表。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -632,14 +632,10 @@ workflow_runtime.runner = _LiveWorkflowRunner()
 
 
 def lead_workflow_dispatch(name: str, tool_input: dict) -> str:
-    """模型侧 Workflow 工具：name/args/resume_from_run_id。"""
+    """模型侧 Workflow 工具：name/args（本版不做断点续跑）。"""
     workflow_name = str(tool_input.get("name", ""))
     args = dict(tool_input.get("args") or {})
-    resume_from = str(tool_input.get("resume_from_run_id") or "").strip()
     try:
-        if resume_from:
-            result = workflow_runtime.run(resume_from, resume=True)
-            return f"resume {resume_from}: {result['status']}"
         run_id = workflow_runtime.start(workflow_name, args)
         result = workflow_runtime.run(run_id)
         steps = result["steps"]

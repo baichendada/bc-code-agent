@@ -34,8 +34,7 @@ WORKFLOW_TOOL_SCHEMA: dict[str, Any] = {
     "name": "Workflow",
     "description": (
         "Run a saved workflow (fixed registration from workflows/*.yaml). "
-        "The model supplies only name/args; orchestration lives in the registry. "
-        "Use resume_from_run_id to continue a previous run (cached steps are reused)."
+        "The model supplies only name/args; orchestration lives in the registry."
     ),
     "input_schema": {
         "type": "object",
@@ -44,10 +43,6 @@ WORKFLOW_TOOL_SCHEMA: dict[str, Any] = {
             "args": {
                 "type": "object",
                 "description": "Arguments; referenced in prompts as {args.key}",
-            },
-            "resume_from_run_id": {
-                "type": "string",
-                "description": "Resume a previous run; unchanged steps replay from journal cache",
             },
         },
         "required": ["name"],
@@ -194,7 +189,7 @@ def validate_schema_value(schema: dict | None, value: Any, depth: int = 0) -> tu
     return True, ""
 
 
-# ---------- journal ----------
+# ---------- journal（审计记录；本版不做断点续跑） ----------
 
 
 def _stable_hash(text: str) -> int:
@@ -202,37 +197,16 @@ def _stable_hash(text: str) -> int:
 
 
 class WorkflowJournal:
-    """append-only jsonl：{key, value}。resume 时 cache 命中即复用。"""
+    """append-only jsonl：每步执行历史（status/输出/耗时），供 /workflow status 与人工排查。"""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.cache: dict[str, Any] = {}
-
-    def load(self) -> None:
-        if not self.path.is_file():
-            return
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict) and "key" in record:
-                self.cache[str(record["key"])] = record.get("value")
-
-    def cached(self, key: str) -> Any:
-        return self.cache.get(key, _MISS)
 
     def record(self, key: str, value: Any) -> None:
-        self.cache[key] = value
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
             handle.flush()
-
-
-_MISS = object()
 
 
 def _step_key(workflow_name: str, step: dict[str, Any]) -> str:
@@ -322,7 +296,7 @@ class WorkflowRuntime:
         self._write_snapshot(run_id, workflow, args, status="running")
         return run_id
 
-    def run(self, run_id: str, resume: bool = False) -> dict[str, Any]:
+    def run(self, run_id: str) -> dict[str, Any]:
         snapshot = self._read_snapshot(run_id)
         if snapshot is None:
             raise WorkflowError(f"run 不存在: {run_id}")
@@ -331,9 +305,6 @@ class WorkflowRuntime:
             raise WorkflowError(f"snapshot 引用的 workflow 不存在: {snapshot['name']}")
         args = snapshot.get("args") or {}
         journal = WorkflowJournal(self._run_dir(run_id) / f"{run_id}.journal.jsonl")
-        if resume:
-            journal.load()
-            print(f"[Workflow] resume {run_id}: 已载入 {len(journal.cache)} 条缓存")
 
         prev_status = "succeeded"  # 初始无前置（当作成功）
         results: dict[str, Any] = {}
@@ -346,16 +317,8 @@ class WorkflowRuntime:
                 print(f"[Workflow] {step_id}: 跳过（run_if={run_if}）")
                 continue
 
-            key = _step_key(str(snapshot["name"]), step)
-            cached = journal.cached(key)
-            if cached is not _MISS and cached.get("status") in ("succeeded", "skipped"):
-                # 只复用成功/跳过记录；failed 不缓存命中 → resume 时失败步骤重新执行
-                results[step_id] = cached
-                print(f"[Workflow] {step_id}: 命中缓存（不重跑）")
-                prev_status = str(cached.get("status", "succeeded"))
-                continue
-
             print(f"[Workflow] {step_id}: 执行中...")
+            key = _step_key(str(snapshot["name"]), step)
             start = time.perf_counter()
             try:
                 value = self._execute_step(workflow, step, args)
