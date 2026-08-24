@@ -26,6 +26,36 @@
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
 
+## 项目收官（2026-08-25）
+
+**从一句“喵～”到能自己干活、自己停、自己定时、自己编排的完整终端 Agent** —— 20 个 Step 全链路完成。
+
+| 维度 | 能力 |
+|---|---|
+| 对话与执行 | 流式对话 / 工具循环 / 语义化文件工具 / 受限 Shell / MCP |
+| 记忆与上下文 | 三层记忆 + 压缩 / Todo 清单 / Session 续聊 |
+| 自主与验收 | Goal Loop（独立评估器判定完成，不自己说自己完成） |
+| 安全与闸门 | 权限管道（deny>ask>allow）/ Hooks 策略链 / 危险命令黑名单 / YOLO 可配 |
+| 协作与委派 | Task 子 Agent（4 个 profile）/ AgentTeam（mailbox + 消息工具） |
+| 异步与调度 | 后台任务（完成注入）/ Cron 定时轮 / Workflow 固定编排（parallel/pipeline） |
+| 教学形态 | 每步独立实录（真实会话） / `guide/` 20 步教程 / 178 项测试 |
+
+**设计主线**：所有的“停”都要核验（Goal）、所有的“动”都要过闸（Permission + Hook）、所有“长事”都可恢复可观察（记忆 / journal / 状态落盘）。
+
+```text
+体验它：
+  python src/bc_code_agent/start.py
+  /goal 运行 date 并汇报当前时间
+  /cron add */5 * * * * 检查 git 状态并汇报
+  /workflow          （然后让模型执行 test-fix-retest / review-changes）
+```
+
+**一个诚实的边界**：这是学习与演示稿 —— 单进程、单会话、终端交互；不要拿它上生产，也别对重要目录裸跑。
+
+（运行环境与配置见文末「快速开始」。）
+
+## Step 2 现象：能循环，但不记得上文
+
 ## Step 2 现象：能循环，但不记得上文
 
 当前实现是外层套了 `while True`，每次只把**本轮**用户输入发给模型：
