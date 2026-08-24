@@ -20,8 +20,7 @@
 - [x] **Step 14**：Goal Loop（可验证终点 + 独立核验才停）
 - [x] **Step 15**：Permission 管道（工具前 allow/ask/deny 一等公民）
 - [x] **Step 16**：Background Shell（慢命令后台 + 完成通知）
-- [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
-- [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
+- [ ] **Step 17/18**：Task 图 + Team v2 ——**暂缓（可选扩展）**：多执行者协作方向；单人场景已被 Workflow 的 parallel/pipeline、Todo、Cron 覆盖；将来要做“无人值守多 Agent 系统”时一起做，17 先于 18
 - [x] **Step 19**：Cron（到点触发）
 - [x] **Step 20**：Workflow Runtime（固定编排脚本 + journal 审计）
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
@@ -1030,8 +1029,11 @@ Enter a prompt: 请用 Workflow 工具执行 review-changes，将以下代码作
 
 ```text
 完成: Step 1–16 + 19 + 20（单人 agent harness 全链）
-暂缓: Step 17（Task 图）/ 18（Team v2）—— 多执行者协作，单人场景不需要；
-      将来想要时 17 先于 18（没有图就没有领取对象）
+暂缓: Step 17/18（Task 图 + Team v2）—— 多执行者协作方向，是“无人值守多 Agent 系统”
+      才需要的形态；单人场景已被覆盖：
+      · 并发/依赖 → Workflow 的 parallel/pipeline + run_if 引用
+      · 任务清单   → Todo（Step 8）；到点发现工作 → Cron（Step 19）
+      将来想要时一起做，17（任务图）先于 18（领取 + worktree）
 可能的下一步: 模型生成 workflow 脚本（Workflow generate + 确认后入库 = 业界 dynamic workflows 路线）
 ```
 
@@ -1040,12 +1042,11 @@ Enter a prompt: 请用 Workflow 工具执行 review-changes，将以下代码作
 | 14 Goal Loop ✅ | 外循环：有目标就一直跑，独立核验才停 | 切口就在 `stop_reason != tool_use`；pause 可复用 `--session` | `/goal` + `goal.json` + block 上限 + 独立评估器 |
 | 15 Permission ✅ | 工具前 allow/ask/deny | Goal 会无人值守跑更久；Hook 做扩展不是唯一闸门 | `permissions.json`；TTY 确认；YOLO=1 |
 | 16 Background Shell ✅ | 慢命令后台，完成再注入 | 否则 Goal 里 pytest/npm 会堵住整轮 | `background=true`；完成写一条消息进下一轮 |
-| 17 Task 图 ⏸ | 落盘任务 + `blockedBy` | 多执行者协作（Step 18 前置）；单人场景暂缓 | `tasks.jsonl`；`/tasks` |
-| 18 Team v2 ⏸ | 原子领取 + worktree | 依赖任务图；暂缓 | 领取 CAS；每任务一个 worktree |
+| 17/18 Task 图 + Team v2 ⏸ | 落盘任务 + `blockedBy` + 原子领取 + worktree | **暂缓**：多执行者协作方向；单人场景被 Workflow(parallel/pipeline) + Todo + Cron 覆盖；想要时一起做 | （s10 设计可直接参考，不另起一步） |
 | 19 Cron ✅ | 到点自己开火 | 发现工作 ≠ 做完一件事（后者是 Goal） | `cron.json` 到点往 `/goal` 丢一条 |
 | 20 Workflow | 固定编排用脚本 + journal | 路径固定时别再让模型每步想 | 一种：测→改→再测，断点可续 |
 
-不要抢跑：先做 Cron/Workflow（没有 Goal 仍是跑一轮就停）；先做 worktree（没有任务图就没有领取对象）；把 Todo 当成 Goal（Todo 是 checklist，Goal 是宿主外循环 + 核验器）。
+不要抢跑：先做 Cron/Workflow（没有 Goal 仍是跑一轮就停）；先做 worktree（没有任务图就没有领取对象）；把 Todo 当成 Goal（Todo 是 checklist，Goal 是宿主外循环 + 核验器）。17/18 已判定暂缓（见上）。
 
 ### Step 14 MVP 草案
 
