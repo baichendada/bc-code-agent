@@ -874,47 +874,76 @@ Enter a prompt: /bg
 
 实现：`src/bc_code_agent/cron.py`（CronStore / validate / matches）+ `start.py`（run_turn 函数化 + agent_lock + 双线程）。
 
-### 实录（2026-08-24，session=`20260824-023112` 等）
+### 实录（2026-08-25，session=`20260825-011528`）
 
-**命令链路（注册 / 列表 / run-now）：**
+**注册 / 校验 / 自动投递：**
 
 ```text
-Enter a prompt: /cron add */1 * * * * 运行 date 并汇报当前时间
-[Cron] 已注册 c_0001: */1 * * * * → 运行 date 并汇报当前时间
+Enter a prompt: /cron add */5 * * * * 运行 date 并汇报当前时间
+[Cron] 已注册 c_0001: */5 * * * * → 运行 date 并汇报当前时间
+
+Enter a prompt: /cron add 99 * * * * 运行 echo hi
+[Cron] 添加失败: minute: 99 超出范围 [0-59]      ← 校验生效
+
+（用户不输入）[Cron] 到点投递 1 个定时任务        ← 01:16 分钟自动触发
+[Shell]: powershell Get-Date → [Agent]: 当前时间：2026年8月25日（星期二）凌晨 01:16:03
+```
+
+**run-now / 列表 / pause / resume / rm：**
+
+```text
+Enter a prompt: /cron run-now c_0001
+[Cron] 手动触发 c_0001  → 立即跑一轮
 
 Enter a prompt: /cron
-id        cron                  状态    prompt
-c_0001    */1 * * * *           运行    运行 date 并汇报当前时间
+id        cron                 状态    prompt
+c_0001    */5 * * * *          运行    运行 date 并汇报当前时间
+c_0002    0 9 * * 1-5          运行    工作日九点晨检
 
-Enter a prompt: /cron run-now c_0001
-[Cron] 手动触发 c_0001
-[Agent]: 主人～奴家查好啦，向您汇报当前时间喵～ 2026年8月24日（星期一）凌晨 02:30:52
+Enter a prompt: /cron pause c_0001    → 已暂停（之后只看到 c_0003 每分钟任务在响，c_0001 静默）
+Enter a prompt: /cron resume c_0001   → 已恢复
+Enter a prompt: /cron rm c_0001       → 已删除
 ```
 
-**每分钟自动投递（用户全程不输入）：**
+**定时轮权限不弹窗（核心安全点）：**
 
 ```text
-[Cron] 到点投递 1 个定时任务
-[Agent]: 当前时间：2026-08-24 02:31:21 ...
-[Cron] 到点投递 1 个定时任务
-[Agent]: 当前时间：2026-08-24 02:32:02 ...
+Enter a prompt: /cron add */1 * * * * 运行 git push origin main 并汇报结果
+（自动触发）[Permission] 定时任务运行中，跳过交互确认 → 拒绝:
+            工具调用 Shell 匹配规则「Shell(git push*|git commit*)」：需要确认
+[Agent]: git push origin main 未能执行...定时轮里默认拒绝未确认的危险操作（防止主人不在时乱推代码）
 ```
 
-**模型工具通道（ScheduleCron → ListCrons → CancelCron）：**
+**模型工具通道（ScheduleCron → ListCrons → CancelCron；用户轮才弹确认）：**
 
 ```text
-[ScheduleCron]: {'cron': '*/5 * * * *', 'prompt': '执行 Shell 命令 git status 检查当前仓库状态...'}
-[result]: 已注册 c_0001: */5 * * * * → 执行 Shell 命令 git status 检查当前仓库状态...
-[ListCrons]: {} → id 列表
-[CancelCron]: {'id': 'c_0001'} → 已删除
+[permission] 工具调用 ScheduleCron...是否继续执行？输入 y 继续，其余取消: y   ← 用户轮正常弹窗
+[ScheduleCron]: {'cron': '*/5 * * * *', 'prompt': '运行 git status...'} → 已注册 c_0005
+[ListCrons]: {} → 列表（含模型自己能看到「待投递」状态）
+[permission] ...输入 y 继续: y
+[CancelCron]: {'id': 'c_0005'} → 已删除
+```
+
+**--session 持久化恢复：**
+
+```text
+$ python src/bc_code_agent/start.py --session 20260825-011528
+Enter a prompt: /cron
+id        cron                 状态    prompt
+c_0002    0 9 * * 1-5          运行    工作日九点晨检
+c_0003    */1 * * * *          运行    运行 date 并汇报当前时间
+c_0004    */1 * * * *          运行    运行 git push origin main 并汇报结果
 ```
 
 要点：
 
 1. **调度与执行分离**：CronStore 只回答「何时到点」（pending+last_fired 防重），投递/轮次复用现有 run_turn
 2. **三线程模型**：调度 / 队列处理器 / 主输入；`agent_lock` 非阻塞抢占决定谁跑（用户轮优先，cron 轮排队）
-3. **定时轮不等于命令**：到点触发的是完整 agent turn，[Scheduled] 消息后的工具/Goal/权限全部照常
-4. **边界**：进程活着才调度；真无人值守 → 系统任务计划器/crontab 配合 `--session`（README 有说明）
+3. **定时轮不等于命令**：到点触发的是完整 agent turn，[Scheduled] 消息后的工具/Goal/权限全部照常（模型可在定时轮里主动 ListCrons 查看）
+4. **定时轮权限 fail-closed**：ask 不弹终端直接拒绝（YOLO=1 优先放行）；模型收到拒绝不会重试绕过
+5. **暂停即静默**：`pause` 后到点不投递（不影响其它任务）；`rm` 删除定义
+6. **会话级持久化**：`sessions/<id>/cron.json`，`--session` 恢复任务定义；停机错过的时刻不补跑
+7. **边界**：进程活着才调度；真无人值守 → 系统任务计划器/crontab 配合 `--session`
 
 ## 后续规划
 
