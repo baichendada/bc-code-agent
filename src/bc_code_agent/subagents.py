@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from file_tools import FILE_TOOL_SCHEMAS
@@ -171,7 +172,9 @@ def run_subagent(
     reasoning_effort: str,
     track_usage: Callable[[Any, str], None] | None = None,
     permission_checker: Callable[[str, dict], str | None] | None = None,
+    schema: dict | None = None,
 ) -> str:
+    """执行子 Agent；schema 非 None 时强制结构化 JSON 输出（校验失败重试一次）。"""
     if profile not in PROFILES:
         return f"Unknown subagent_type: {profile!r}. Known: {', '.join(SUBAGENT_TYPES)}"
 
@@ -188,45 +191,91 @@ def run_subagent(
         background_allowed=False,
     )
 
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt.strip()}]
-
-    for turn in range(max_turns):
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=messages,
-            system=system,
-            tools=tools,
-            extra_body={
-                "thinking": {"type": thinking_type},
-                "reasoning_effort": reasoning_effort,
-            },
-        )
-        if track_usage is not None:
-            track_usage(message, kind=f"subagent:{profile}")
-
-        assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.content}
-        messages.append(assistant_msg)
-
-        if message.stop_reason != "tool_use":
-            text = next((b.text for b in message.content if b.type == "text"), "")
-            return text.strip() or "(subagent finished with no text)"
-
-        tool_results: list[dict[str, Any]] = []
-        for block in message.content:
-            if block.type != "tool_use":
-                continue
-            result = executor.run(block.name, dict(block.input))
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                }
+    def run_once(text_prompt: str) -> tuple[str, dict | None]:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": text_prompt.strip()}]
+        for turn in range(max_turns):
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=messages,
+                system=system,
+                tools=tools,
+                extra_body={
+                    "thinking": {"type": thinking_type},
+                    "reasoning_effort": reasoning_effort,
+                },
             )
-        messages.append({"role": "user", "content": tool_results})
+            if track_usage is not None:
+                track_usage(message, kind=f"subagent:{profile}")
 
-    return (
-        f"Subagent {profile!r} reached max turns ({max_turns}) "
-        "without finishing. Try a narrower prompt or split the task."
-    )
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.content}
+            messages.append(assistant_msg)
+
+            if message.stop_reason != "tool_use":
+                text = next((b.text for b in message.content if b.type == "text"), "")
+                return text.strip() or "(subagent finished with no text)", messages
+
+            tool_results: list[dict[str, Any]] = []
+            for block in message.content:
+                if block.type != "tool_use":
+                    continue
+                result = executor.run(block.name, dict(block.input))
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+        return (
+            f"Subagent {profile!r} reached max turns ({max_turns}) "
+            "without finishing. Try a narrower prompt or split the task.",
+            messages,
+        )
+
+    def parse_json(text: str) -> dict | None:
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            stripped = "\n".join(lines).strip()
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    base_prompt = prompt.strip()
+    if schema is not None:
+        from workflow import validate_schema_value
+
+        base_prompt += (
+            "\n\n必须只返回一个 JSON 对象（不要其它文字），结构如下：\n"
+            f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
+        )
+        text, _ = run_once(base_prompt)
+        value = parse_json(text)
+        if value is None:
+            text, _ = run_once(base_prompt + "\n\n上次输出不是合法 JSON。请重新只返回 JSON 对象。")
+            value = parse_json(text)
+        if value is None:
+            return "[Workflow] agent 输出不是合法 JSON（重试后仍失败）"
+        ok, err = validate_schema_value(schema, value)
+        if not ok:
+            text, _ = run_once(
+                base_prompt
+                + f"\n\n上次输出不符合结构（{err}）。请重新只返回符合结构的 JSON 对象。"
+            )
+            value = parse_json(text)
+            if value is not None:
+                ok, err = validate_schema_value(schema, value)
+            if value is None or not ok:
+                return f"[Workflow] agent 输出不符合 schema（{err}）"
+        return value
+
+    text, _ = run_once(base_prompt)
+    return text

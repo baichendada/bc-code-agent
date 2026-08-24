@@ -1,0 +1,60 @@
+name: review-changes
+description: 多维度并行审查变更（3 维度审计并发 + 每维度复核流水线）
+phases: [Audit, Verify]
+steps:
+  # ---- 并行审计：3 个维度同时审（barrier：全部返回才继续）----
+  - id: audit-dimensions
+    type: parallel
+    label: 多维度审计
+    agents:
+      - profile: review
+        label: 安全审计
+        prompt: |
+          只读审查以下代码变更中的安全问题：
+          {args.changes}
+          只返回 JSON 对象：{"findings": [{"title": string, "severity": string}]}
+        schema:
+          type: object
+          required: [findings]
+          properties:
+            findings: { type: array }
+      - profile: review
+        label: 性能审计
+        prompt: |
+          只读审查以下代码变更中的性能问题：
+          {args.changes}
+          只返回 JSON 对象：{"findings": [{"title": string, "severity": string}]}
+        schema:
+          type: object
+          required: [findings]
+          properties:
+            findings: { type: array }
+      - profile: review
+        label: 正确性审计
+        prompt: |
+          只读审查以下代码变更中的正确性问题（边界/竞态/逻辑顺序）：
+          {args.changes}
+          只返回 JSON 对象：{"findings": [{"title": string, "severity": string}]}
+        schema:
+          type: object
+          required: [findings]
+          properties:
+            findings: { type: array }
+  # ---- 复核流水线：每个维度独立走一遍复核 stage（无 barrier，完成即推进）----
+  - id: verify-pipeline
+    type: pipeline
+    label: 逐维度复核
+    items: [security, performance, correctness]
+    stages:
+      - profile: review
+        label: 复核
+        prompt: |
+          针对「{args.item}」维度，复核以下变更是否还有遗漏的高严重度问题：
+          {args.changes}
+          只返回 JSON 对象：{"ok": boolean, "note": string}
+        schema:
+          type: object
+          required: [ok, note]
+          properties:
+            ok: { type: boolean }
+            note: { type: string }

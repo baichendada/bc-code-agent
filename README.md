@@ -23,7 +23,7 @@
 - [ ] **Step 17**：Task 图（落盘任务 + `blockedBy`）
 - [ ] **Step 18**：Team v2（原子领取 + 任务绑定 worktree）
 - [x] **Step 19**：Cron（到点触发）
-- [ ] **Step 20**：Workflow Runtime（固定编排脚本 + journal 可 resume）
+- [x] **Step 20**：Workflow Runtime（固定编排脚本 + journal 可 resume）
 - [ ] **加深（有空再补）**：压缩分级砍 tool_result；MCP 给队友；Hook 的 http/prompt/agent  
   - **不要上生产 / 别对重要目录裸跑**
 
@@ -945,19 +945,66 @@ c_0004    */1 * * * *          运行    运行 git push origin main 并汇报�
 6. **会话级持久化**：`sessions/<id>/cron.json`，`--session` 恢复任务定义；停机错过的时刻不补跑
 7. **边界**：进程活着才调度；真无人值守 → 系统任务计划器/crontab 配合 `--session`
 
-## 后续规划
+## Step 20：Workflow Runtime（固定编排）
 
-前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / permission 管道 / background shell / **cron 调度（Step 19）**。  
-差的是最后一块：固定路径的收口。排序原则：
+固定路径别让模型每步想：`workflows/*.yaml` 注册编排，模型只需给 name/args；运行记录 journal，断点可续跑。
 
-1. 先改循环的停法，再加外围调度（已完成：Step 14）  
-2. 无人值守闸门已齐（Step 15：权限 + YOLO；配合 Step 12 Hook）  
-3. 长命令已让路（Step 16：后台任务 + Goal defer）  
-4. 到点触发已就位（Step 19：cron → 完整 agent turn）  
+| 项 | 说明 |
+|---|---|
+| 注册 | `workflows/*.yaml`（YAML，需 pyyaml）：name（slug）/ description / phases / steps；坏文件跳过并告警 |
+| Step 类型 | `command`（本地命令）/ `agent`（子 Agent，profile+prompt）/ `parallel`（多 agent 并发 barrier）/ `pipeline`（items × stages，每 item 独立走完） |
+| 条件 | `run_if: always \| prev_failed \| prev_succeeded \| <step_id>.failed \| <step_id>.succeeded`（引用任此前置步骤；跳过不污染 prev 状态） |
+| 结构化输出 | agent step 可选 `schema`：简版校验（type/required/properties），失败重试一次，仍失败 → 该步骤 failed |
+| 安全 | `Workflow` 工具本身权限 ask；**command 步骤逐条过同一道闸**（危险命令黑名单 + permission_gate：deny/ask/yolo/scheduled 全部生效） |
+| journal | `sessions/<id>/workflows/<runId>/`：快照 json + `<runId>.journal.jsonl`（每步 {key, value}）+ 排他锁（O_EXCL） |
+| resume | `resume_from_run_id`：按步骤定义语义 key 命中缓存（**只复用 succeeded/skipped**；failed 步骤重跑，失败可重试） |
+| 命令/工具 | `/workflow`（list）/ `/workflow status <runId>`；工具 `Workflow`（name/args/resume_from_run_id） |
+| 边界 | run 目录在 session 下：`--session` 恢复同一 session 才能 resume（新 session 看不到旧 run） |
+
+实现：`src/bc_code_agent/workflow.py`（registry / schema 校验 / journal / runtime）+ 示例 `workflows/test-fix-retest.yaml`、`workflows/review-changes.yaml`。
+
+### 实录（2026-08-25）
+
+**列表与权限：**
 
 ```text
-现在 (Chat loop + Hooks + Permission + Session 续聊 + Goal Loop + Background + Cron)
-    → 20 Workflow（固定路径用代码编）
+/workflow
+name                描述
+review-changes       多维度并行审查变更（3 维度审计并发 + 每维度复核流水线）
+test-fix-retest      运行项目测试；失败则 review 定位 → general 修复 → 复测（展开 2 轮）
+
+模型调用 Workflow 工具 → [Permission: 拒绝] 用户未确认（非交互 fail-closed）
+→ 模型换合规路径：改用 3 个并行 review Task 手动复刻审计（不硬绕）
+```
+
+**执行链路（YOLO=1 实测，test-fix-retest）：**
+
+```text
+[Workflow]: {'name': 'test-fix-retest'}
+[Workflow] test-1: 执行中...
+[Workflow] diagnose-1: 执行中...      ← test-1 失败 → run_if=test-1.failed 命中
+[Workflow] agent(定位失败原因) profile=review
+[Workflow] fix-1: 执行中...          ← diagnose-1.succeeded → 修复执行
+journal: 每步一行 {key, value}（含失败记录）
+```
+
+要点：
+
+1. **编排进配置，模型只选**：命令清单写在 yaml（人审）；模型不能注入可执行代码
+2. **安全不绕行**：command 步骤与模型 Shell 同一道闸（黑名单 + permission_gate）；agent 子步骤走子 Agent 通道（权限照常）
+3. **条件引用前置步骤**：`test-1.failed` 表达“测试失败后的分支”，而不是只看紧邻上一步（否则 诊断成功 → 修复被跳过）
+4. **失败可重试**：resume 只复用成功；失败步骤重新执行（瞬时 API/命令失败可续跑）
+5. **schema 失败即步骤失败**：结构化输出不合规不会混进 completed（坏结果不入 journal 复用）
+
+## 后续规划
+
+前半程已齐：loop / tools / skill / memory / todo / subagent / team mailbox / MCP / hooks / session 续聊 / goal loop / permission 管道 / background shell / cron 调度 / **workflow runtime（Step 20）**。  
+
+```text
+完成: Step 1–16 + 19 + 20（单人 agent harness 全链）
+暂缓: Step 17（Task 图）/ 18（Team v2）—— 多执行者协作，单人场景不需要；
+      将来想要时 17 先于 18（没有图就没有领取对象）
+可能的下一步: 模型生成 workflow 脚本（Workflow generate + 确认后入库 = 业界 dynamic workflows 路线）
 ```
 
 | Step | 做什么 | 为什么排这里 | MVP |

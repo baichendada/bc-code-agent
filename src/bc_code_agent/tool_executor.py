@@ -64,6 +64,7 @@ class ToolExecutor:
         team_dispatch: Callable[[str, dict], str] | None = None,
         mcp_dispatch: Callable[[str, dict], str] | None = None,
         cron_dispatch: Callable[[str, dict], str] | None = None,
+        workflow_dispatch: Callable[[str, dict], str] | None = None,
         permission_checker: Callable[[str, dict], str | None] | None = None,
         background_allowed: bool = True,
         log: bool = True,
@@ -77,6 +78,7 @@ class ToolExecutor:
         self.team_dispatch = team_dispatch
         self.mcp_dispatch = mcp_dispatch
         self.cron_dispatch = cron_dispatch
+        self.workflow_dispatch = workflow_dispatch
         self.permission_checker = permission_checker
         self.background_allowed = background_allowed
         self.log = log
@@ -186,6 +188,14 @@ class ToolExecutor:
             if self.cron_dispatch is None:
                 return f"Tool not allowed: {name}"
             result = self.cron_dispatch(name, tool_input)
+            if self.log:
+                print(f"{self._tag('result')}: {result[:500]}")
+            return result
+
+        if name == "Workflow":
+            if self.workflow_dispatch is None:
+                return f"Tool not allowed: {name}"
+            result = self.workflow_dispatch(name, tool_input)
             if self.log:
                 print(f"{self._tag('result')}: {result[:500]}")
             return result

@@ -36,6 +36,7 @@ DEFAULT_RULES: list[dict[str, str]] = [
     # Cron 工具（Step 19）：查看放行；注册/取消是敏感操作 → ask
     {"match": "ListCrons", "decision": "allow"},
     {"match": "ScheduleCron|CancelCron", "decision": "ask"},
+    {"match": "Workflow", "decision": "ask"},
 ]
 
 DECISIONS = ("deny", "ask", "allow")

@@ -1,0 +1,77 @@
+name: test-fix-retest
+description: 运行项目测试；失败则 review 定位 → general 修复 → 复测（展开 2 轮）
+phases: [Test, Diagnose, Fix, Retest]
+steps:
+  # ---- 第 1 轮 ----
+  - id: test-1
+    type: command
+    command: python -m unittest discover -s tests -p "test_*.py"
+    label: 运行测试（第 1 轮）
+  - id: diagnose-1
+    type: agent
+    profile: review
+    run_if: test-1.failed
+    label: 定位失败原因
+    prompt: |
+      项目最近一次测试失败。请阅读 tests/ 与 src/ 中相关代码，定位失败根因。
+      只返回 JSON 对象：{"root_cause": string, "files": [string]}
+    schema:
+      type: object
+      required: [root_cause, files]
+      properties:
+        root_cause: { type: string }
+        files: { type: array }
+  - id: fix-1
+    type: agent
+    profile: general
+    run_if: diagnose-1.succeeded
+    label: 修复第 1 轮
+    prompt: |
+      根据以下诊断修复代码（不要改 tests/ 下的测试文件）：
+      {args.diagnosis}
+      只返回 JSON 对象：{"summary": string, "changed_files": [string]}
+    schema:
+      type: object
+      required: [summary, changed_files]
+      properties:
+        summary: { type: string }
+        changed_files: { type: array }
+  # ---- 第 2 轮（test-2 无条件复跑；diagnose-2/fix-2 仅当仍失败）----
+  - id: test-2
+    type: command
+    command: python -m unittest discover -s tests -p "test_*.py"
+    label: 复测（第 2 轮）
+  - id: diagnose-2
+    type: agent
+    profile: review
+    run_if: test-2.failed
+    label: 再定位
+    prompt: |
+      上一轮修复后测试仍失败。请读取测试输出与代码，指出仍失败的原因。
+      只返回 JSON 对象：{"root_cause": string, "files": [string]}
+    schema:
+      type: object
+      required: [root_cause, files]
+      properties:
+        root_cause: { type: string }
+        files: { type: array }
+  - id: fix-2
+    type: agent
+    profile: general
+    run_if: diagnose-2.succeeded
+    label: 修复第 2 轮
+    prompt: |
+      上一轮修复后测试仍失败。根据诊断再次修复（不要改 tests/ 下的测试文件）：
+      {args.diagnosis}
+      只返回 JSON 对象：{"summary": string, "changed_files": [string]}
+    schema:
+      type: object
+      required: [summary, changed_files]
+      properties:
+        summary: { type: string }
+        changed_files: { type: array }
+  # ---- 终测 ----
+  - id: test-3
+    type: command
+    command: python -m unittest discover -s tests -p "test_*.py"
+    label: 终测

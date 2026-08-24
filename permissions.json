@@ -12,6 +12,7 @@
     { "match": "Shell(*)", "decision": "allow" },
     { "match": "mcp__*", "decision": "allow" },
     { "match": "ListCrons", "decision": "allow" },
-    { "match": "ScheduleCron|CancelCron", "decision": "ask" }
+    { "match": "ScheduleCron|CancelCron", "decision": "ask" },
+    { "match": "Workflow", "decision": "ask" }
   ]
 }

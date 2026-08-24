@@ -45,6 +45,13 @@ from goal import (
 from permissions import PermissionsConfig
 from bg_jobs import BACKGROUND, format_task_list, install_cleanup
 from cron import CRON_TOOL_SCHEMAS, CronError, CronStore, format_status_message
+from workflow import (
+    WORKFLOW_TOOL_SCHEMA,
+    WorkflowError,
+    WorkflowRegistry,
+    WorkflowRuntime,
+    WorkflowRunner,
+)
 
 # 项目根：.../src/bc_code_agent/start.py → parents[2]
 ROOT = Path(__file__).resolve().parents[2]
@@ -240,6 +247,12 @@ Cron（定时任务）规则：
 1. 需要周期性执行的任务可注册 ScheduleCron（5 段表达式：分 时 日 月 周），到点会以 [Scheduled] 消息触发一轮。
 2. 定时轮中的权限 ask 默认拒绝（不抢终端确认）；需要放行请改 permissions.json 或设 YOLO=1。
 3. 用 ListCrons / CancelCron 查看与取消；主人也可用 /cron 管理。
+
+Workflow（固定编排）规则：
+1. 固定路径的任务（如 测试→修复→复测、多维度审查）用 Workflow 工具执行，编排在 workflows/*.yaml 注册（本人只需给 name/args）。
+2. agent 步骤可能返回结构化 JSON（schema）——按结构处理，不要忽略字段。
+3. 运行失败可带 resume_from_run_id 续跑（未变化的步骤复用 journal 缓存，不重跑）。
+4. 用 /workflow list 看注册表；/workflow status <runId> 看运行状态。
 """.strip()
 
 skills_prompt = skill_loader.catalog_prompt()
@@ -353,6 +366,7 @@ TOOLS = [
     TASK_TOOL_SCHEMA,
     *TEAM_TOOL_SCHEMAS,
     *CRON_TOOL_SCHEMAS,
+    WORKFLOW_TOOL_SCHEMA,
 ]
 
 
@@ -565,6 +579,80 @@ def lead_cron_dispatch(name: str, tool_input: dict) -> str:
         return cron_store.remove(str(tool_input.get("id", "")))
     return f"Unknown cron tool: {name}"
 
+
+# ---- Workflow（Step 20）：注册表 + 运行时（生产 runner 复用 run_subagent）----
+
+
+def workflow_command_guard(name: str, tool_input: dict) -> str | None:
+    """command 步骤的闸：黑名单兜底 → 权限管道（返回非 None = 拒绝消息）。"""
+    command = str(tool_input.get("command") or "")
+    from security import match_shell_command
+
+    hit = match_shell_command(command)
+    if hit:
+        pattern, description = hit
+        return f"Security: 危险命令已拦截：{description}（匹配模式：{pattern}）"
+    blocked, _approved = permission_gate("Shell", tool_input)
+    return blocked
+
+
+workflow_registry = WorkflowRegistry(ROOT / "workflows")
+workflow_registry.load()
+workflow_runtime = WorkflowRuntime(
+    workflow_registry,
+    runner=WorkflowRunner(),
+    store_dir=memory.dir / "workflows",
+    cwd=ROOT,
+    command_guard=workflow_command_guard,
+)
+
+
+class _LiveWorkflowRunner(WorkflowRunner):
+    """生产 runner：agent step 走现有 run_subagent（含 schema 结构化输出）。"""
+
+    def run_agent(self, profile: str, prompt: str, schema: dict | None, label: str) -> Any:
+        print(f"[Workflow] agent({label}) profile={profile}")
+        return run_subagent(
+            client=client,
+            model=MODEL,
+            profile=profile,
+            prompt=prompt,
+            load_skill=skill_loader.view,
+            web_search=web_search,
+            max_tokens=MAX_TOKENS,
+            thinking_type=THINKING_TYPE,
+            reasoning_effort=REASONING_EFFORT,
+            track_usage=track_usage,
+            permission_checker=executor_permission_checker,
+            schema=schema,
+        )
+
+
+workflow_runtime.runner = _LiveWorkflowRunner()
+
+
+def lead_workflow_dispatch(name: str, tool_input: dict) -> str:
+    """模型侧 Workflow 工具：name/args/resume_from_run_id。"""
+    workflow_name = str(tool_input.get("name", ""))
+    args = dict(tool_input.get("args") or {})
+    resume_from = str(tool_input.get("resume_from_run_id") or "").strip()
+    try:
+        if resume_from:
+            result = workflow_runtime.run(resume_from, resume=True)
+            return f"resume {resume_from}: {result['status']}"
+        run_id = workflow_runtime.start(workflow_name, args)
+        result = workflow_runtime.run(run_id)
+        steps = result["steps"]
+        summary = "\n".join(
+            f"  {sid}: {rec.get('status')}" for sid, rec in steps.items()
+        )
+        return (
+            f"[Workflow] {workflow_name} run={run_id} → {result['status']}\n"
+            f"{summary}"
+        )
+    except WorkflowError as exc:
+        return f"[Workflow] 运行失败: {exc}"
+
 mcp_hub = McpHub(MCP_CONFIG, default_root=ROOT)
 print(mcp_hub.start())
 TOOLS.extend(mcp_hub.tool_schemas)
@@ -588,6 +676,7 @@ main_executor = ToolExecutor(
     team_dispatch=lead_team_dispatch,
     mcp_dispatch=lead_mcp_dispatch,
     cron_dispatch=lead_cron_dispatch,
+    workflow_dispatch=lead_workflow_dispatch,
 )
 
 HOOKS = load_hooks_from_config(
@@ -838,6 +927,23 @@ def handle_slash_command(raw: str) -> bool:
     return False
 
 
+def handle_workflow_command(raw: str) -> bool:
+    """/workflow：list（注册表）/ status <runId>（运行状态）。"""
+    line = raw.strip()
+    if not line.lower().startswith("/workflow"):
+        return False
+    arg = line[len("/workflow"):].strip()
+    if not arg:
+        print(workflow_registry.list_text() + "\n")
+        return True
+    cmd, _, rest = arg.partition(" ")
+    if cmd.lower() == "status" and rest.strip():
+        print(workflow_runtime.format_status(rest.strip()) + "\n")
+        return True
+    print("用法: /workflow | /workflow status <runId>\n")
+    return True
+
+
 def handle_cron_command(raw: str) -> bool:
     """/cron：列表 / <5 段表达式> <prompt> 添加 / rm <id> / run-now <id> / pause|resume <id>。"""
     line = raw.strip()
@@ -1084,6 +1190,8 @@ while True:
         user_msg = {"role": "user", "content": user_input[len("/goal"):].strip()}
     else:
         if handle_cron_command(user_input):
+            continue
+        if handle_workflow_command(user_input):
             continue
         if handle_permissions_command(user_input):
             continue
